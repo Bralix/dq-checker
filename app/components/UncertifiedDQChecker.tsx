@@ -411,9 +411,19 @@ function hasShift(arr:Evt[]){ return arr.some(e=>e.status==="ON" || e.status==="
 function firstOfType(arr:Evt[], type:"ON"|"D"){ return arr.find(e=>e.status===type) || null; }
 function lastShiftStartAtOrBefore(starts: Date[], t: Date): Date | null {
   let best: Date | null = null;
-  for (const s of starts) if (s.getTime() <= t.getTime()) best = !best || s > best ? s : best;
+  const tMs = t.getTime();
+  for (const s of starts) {
+    const sMs = s.getTime();
+    if (sMs <= tMs) {
+      if (!best || sMs > best.getTime()) {
+        best = s;
+      }
+    }
+  }
   return best;
 }
+
+
 
 /** Determine prior uncertified *shift* days relative to cutoff time T (only days < iso(T)). */
 function missingPriorShiftDaysByTime(
