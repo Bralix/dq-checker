@@ -1,34 +1,10 @@
 "use client";
 
-import React, { useState, useRef, useMemo, useEffect } from "react";
+import React, { useState, useRef, useMemo } from "react";
 import * as XLSX from "xlsx";
+import UncertifiedDQChecker from "./components/UncertifiedDQChecker";
 
-/* ===================== Tiny utils / theme ===================== */
-const norm = (s: any) =>
-  String(s ?? "")
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .replace(/[^\w ,.'-]/g, "")
-    .trim();
-
-// very small Levenshtein ratio (0..1)
-function levRatio(a: string, b: string) {
-  const m = a.length, n = b.length;
-  if (!m && !n) return 1;
-  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
-    }
-  }
-  const dist = dp[m][n];
-  const maxLen = Math.max(m, n) || 1;
-  return 1 - dist / maxLen;
-}
-
+/* ===================== Theme ===================== */
 const theme = {
   bg: "#0a0f1c",
   panel: "#0f172a",
@@ -58,6 +34,22 @@ function Card(props: React.HTMLAttributes<HTMLDivElement>) {
   );
 }
 
+// Map the night of dispatch (shift start date) to the expected series.
+function expectedSeriesForStart(date: Date): number | null {
+  const dow = date.getDay();
+  if (dow === 6) return null; // Saturday night excluded
+  return (dow + 1) * 100; // Sun=100, Mon=200, ... Fri=600
+}
+
+// Extract the series bucket from the route (e.g., "103RIV-285" → 100)
+function routeSeriesBucket(route: string): number | null {
+  const m = String(route).trim().match(/^(\d{1,3})/);
+  if (!m) return null;
+  const num = parseInt(m[1], 10);
+  if (isNaN(num)) return null;
+  return Math.floor(num / 100) * 100 || 0;
+}
+
 function Button({
   children,
   variant = "primary",
@@ -82,7 +74,7 @@ function Button({
       color: "white",
       boxShadow: "0 4px 20px rgba(124,58,237,0.25)",
     },
-    ghost: {
+  ghost: {
       background: "transparent",
       color: theme.text,
       border: `1px solid ${theme.border}`,
@@ -126,24 +118,6 @@ if (typeof document !== "undefined" && !document.getElementById("spin-keyframes"
   style.id = "spin-keyframes";
   style.innerHTML = `@keyframes spin{to{transform:rotate(360deg)}}`;
   document.head.appendChild(style);
-}
-
-function Stat({
-  label,
-  value,
-  tone = "default",
-}: {
-  label: string;
-  value: React.ReactNode;
-  tone?: "default" | "danger" | "success";
-}) {
-  const color = tone === "danger" ? theme.danger : tone === "success" ? theme.success : theme.text;
-  return (
-    <Card style={{ textAlign: "center", padding: 14 }}>
-      <div style={{ color: theme.sub, fontSize: 13 }}>{label}</div>
-      <div style={{ fontSize: 28, fontWeight: 800, color }}>{value}</div>
-    </Card>
-  );
 }
 
 function FilePicker({
@@ -205,6 +179,7 @@ function FilePicker({
           cursor: "pointer",
           boxShadow: dragActive ? "0 0 0 2px rgba(6,182,212,0.25) inset" : "none",
           transition: "all .15s ease",
+          minWidth: 260,
         }}
         title={multiple ? "Click or drop files" : "Click or drop a file"}
       >
@@ -338,16 +313,6 @@ function Table({ rows, columns }: { rows: any[]; columns?: string[] }) {
 
 /* ===================== Main ===================== */
 export default function Page() {
-  // ==== DQ Checker state ====
-  const [uncertFile, setUncertFile] = useState<File | null>(null);
-  const [availFile, setAvailFile] = useState<File | null>(null);
-  const [threshold, setThreshold] = useState(85);
-  const [msg, setMsg] = useState("");
-  const [perDriver, setPerDriver] = useState<any[]>([]);
-  const [detail, setDetail] = useState<any[]>([]);
-  const [needs, setNeeds] = useState<any[]>([]);
-  const [summary, setSummary] = useState({ total: 0, dq: 0, ok: 0 });
-
   // ==== Payable Hours state (multi-file) ====
   const [logsFiles, setLogsFiles] = useState<File[]>([]);
   const [payableResults, setPayableResults] = useState<any[]>([]);
@@ -359,6 +324,16 @@ export default function Page() {
   const [filterDriver, setFilterDriver] = useState("");
   const [filterFrom, setFilterFrom] = useState("");
   const [filterTo, setFilterTo] = useState("");
+
+  // ==== Stops (dispatch) file + index for route lookups (ID-based) ====
+  const [stopsFile, setStopsFile] = useState<File | null>(null);
+  // Map key: `${driverIdNoLeadingZeros}|YYYY-MM-DD`  ->  [{ route, role }]
+  const [stopsIndex, setStopsIndex] = useState<
+    Map<string, { route: string; role: "driver1" | "driver2"; ts?: Date }[]>
+  >(new Map());
+  // NEW: optional Name index (lastName|date -> Set of ID(no-leading-zeros))
+  const [stopsNameIndex, setStopsNameIndex] = useState<Map<string, Set<string>>>(new Map()); // NEW
+  const [stopsIndexCount, setStopsIndexCount] = useState(0);
 
   const PAYABLE_COLS = [
     "Source",
@@ -388,9 +363,9 @@ export default function Page() {
           if (!d.includes(q)) return false;
         }
         let dt: Date | null = null;
-        if (row.__startISO) dt = new Date(row.__startISO);
+        if (row.__startISO) dt = new Date(row["__startISO"]);
         else if (row["Shift Start"]) {
-          const maybe = new Date(String(row["Shift Start"]));
+          const maybe = new Date(row["Shift Start"]);
           if (!isNaN(maybe.getTime())) dt = maybe;
         }
         if (from && dt && dt < from) return false;
@@ -402,227 +377,135 @@ export default function Page() {
 
   /* ===================== Common helpers ===================== */
   async function readWorkbook(file: File) {
+    const name = (file.name || "").toLowerCase();
+
+    if (name.endsWith(".csv")) {
+      const text = await file.text();
+      return XLSX.read(text, { type: "string" });
+    }
+
     const buf = await file.arrayBuffer();
     return XLSX.read(buf, { type: "array" });
   }
 
-  /* ===================== DQ Checker ===================== */
-  type UncertRow = {
-    driverId: string | number | null;
-    driverName: string;
-    terminal: string | null;
-    date: string | null;
-    nameClean: string;
-  };
-
-  type AvailRow = {
-    driverName: string;
-    status: string;
-    nameClean: string;
-  };
-
-  async function parseUncertified(file: File): Promise<UncertRow[]> {
-    const wb = await readWorkbook(file);
-    const sheet = wb.Sheets["Uncertified Logs"];
-    if (!sheet) throw new Error('Missing sheet "Uncertified Logs" in Uncertified Logs Excel');
-    const rows = XLSX.utils.sheet_to_json<any>(sheet, { defval: null });
-    return rows.map((r) => ({
-      driverId: r["Driver ID"] ?? r["Driver ID: "],
-      driverName: r["Driver Name"],
-      terminal: r["Home Terminal"],
-      date: r["Date"] ? XLSX.SSF.format("yyyy-mm-dd", r["Date"]) : null,
-      nameClean: norm(r["Driver Name"]),
-    }));
+  // Helpers for Stops index / dates / IDs
+  function ymd(d: Date) {
+    return d.toISOString().slice(0, 10);
+  }
+  function addDays(d: Date, n: number) {
+    const x = new Date(d);
+    x.setDate(x.getDate() + n);
+    return x;
   }
 
-  async function parseAvailability(file: File): Promise<AvailRow[]> {
-    if (file.name.toLowerCase().endsWith(".pdf")) {
-      const fd = new FormData();
-      fd.append("file", file);
+  // NEW: extract last name from "Last, F. (ID)" / "Last, First ..."
+  function extractLastName(s: string | null | undefined): string | null {
+    if (!s) return null;
+    const t = String(s).trim();
+    // prefer comma form: "Dominguez Abundis, A. (0000...)"
+    const commaIdx = t.indexOf(",");
+    if (commaIdx > 0) return t.slice(0, commaIdx).trim().toUpperCase();
+    // fallback: first token until space or "("
+    const m = t.match(/^([A-Za-zÁÉÍÓÚÑÜ'`-]+)/);
+    return m ? m[1].toUpperCase() : null;
+  }
 
-      const res = await fetch("/api/parse-availability", { method: "POST", body: fd });
-      const raw = await res.text();
-      let data: any = null;
-      try { data = raw ? JSON.parse(raw) : null; } catch {}
+  // === UPDATED: only for short/truncated IDs (≤4 digits) — try to resolve against Stops for the dispatch window,
+  // and use last-name filter to break ties if name data exists in Stops.
+  function resolveShortIdAgainstStops(
+    partial: string | null,
+    startDate: Date,
+    driverName: string
+  ): string | null {
+    const want = String(partial ?? "").trim();
+    const last = extractLastName(driverName);
 
-      if (!res.ok) {
-        const parts = [data?.error, data?.reason, data?.hint, data?.preview, data?.sniff].filter(Boolean);
-        const msg = parts.length ? parts.join(" | ") : raw || `HTTP ${res.status}`;
-        throw new Error(`PDF parse failed: ${msg}`);
+    const stamps = [ymd(startDate), ymd(addDays(startDate, 1))];
+
+    // 0) If we have no partial digits at all, try last-name-only unique match.
+    if (!want) {
+      if (!last) return null;
+      const idSet = new Set<string>();
+      for (const stamp of stamps) {
+        const key = `${last}|${stamp}`;
+        const ids = stopsNameIndex.get(key);
+        if (ids) ids.forEach((id) => idSet.add(id));
       }
-
-      const rows = (data?.rows ?? []) as any[];
-      return rows.map((r) => ({
-        driverName: r.driverName,
-        status: String(r.status || "").toUpperCase().trim(),
-        nameClean: norm(r.driverName),
-      }));
+      return idSet.size === 1 ? Array.from(idSet)[0] : null;
     }
 
-    let wb: XLSX.WorkBook;
-    if (file.name.toLowerCase().endsWith(".csv")) {
-      wb = XLSX.read(await file.text(), { type: "string" });
-    } else {
-      const buf = await file.arrayBuffer();
-      wb = XLSX.read(buf, { type: "array" });
-    }
-    const sheet = wb.Sheets[wb.SheetNames[0]];
-    const rows = XLSX.utils.sheet_to_json<any>(sheet, { defval: null });
-    if (!rows.length) throw new Error("Availability file is empty.");
+    if (want.length > 4) return null; // only run for 4 or fewer
 
-    const first = rows[0];
-    const lower: Record<string, string> = {};
-    for (const k of Object.keys(first)) lower[k.toLowerCase()] = k;
-
-    const nameKey = Object.keys(lower).find((k) => k.includes("driver") && k.includes("name"));
-    const statusKey =
-      Object.keys(lower).find((k) => k.includes("last calculated status")) ||
-      Object.keys(lower).find((k) => k === "status") ||
-      Object.keys(lower).find((k) => k.includes("last status"));
-
-    if (!nameKey || !statusKey) {
-      throw new Error('Availability needs "Driver Name" and "Status" (or "Last Calculated Status") columns.');
-    }
-
-    return rows.map((r) => ({
-      driverName: r[lower[nameKey]],
-      status: String(r[lower[statusKey]] ?? "").toUpperCase().trim(),
-      nameClean: norm(r[lower[nameKey]]),
-    }));
-  }
-
-  function explain(status: string) {
-    if (status === "ON" || status === "D" || status === "DRIVING")
-      return "❌ True Violation – Disqualified (ON/Driving without certifying)";
-    if (status === "OFF") return "✅ Excused – Off Duty";
-    if (!status || status === "NO DATA")
-      return "⚠️ No Match – Needs Review (no availability record found)";
-    return `⚠️ Needs Review – Unexpected status '${status}'`;
-  }
-
-  function buildTables(rows: any[]) {
-    const verdictMap = new Map<string, boolean>();
-    for (const r of rows) {
-      const key = `${r.driverId}||${r.driverName}||${r.terminal}`;
-      const isDQ = r.decision.startsWith("❌");
-      verdictMap.set(key, (verdictMap.get(key) ?? false) || isDQ);
-    }
-    const perDriver: any[] = [];
-    verdictMap.forEach((isDQ, key) => {
-      const [driverId, driverName, terminal] = key.split("||");
-      perDriver.push({
-        "Driver ID": driverId ?? "",
-        "Driver Name": driverName ?? "",
-        "Home Terminal": terminal ?? "",
-        Verdict: isDQ ? "🚫 Disqualified" : "✅ Qualified",
-      });
-    });
-    perDriver.sort((a, b) => (a["Driver Name"] || "").localeCompare(b["Driver Name"] || ""));
-
-    const detail = rows.map((r) => ({
-      "Driver ID": r.driverId ?? "",
-      "Driver Name": r.driverName ?? "",
-      "Home Terminal": r.terminal ?? "",
-      Date: r.date ?? "",
-      "Matched Name (from Availability)": r.matchedName ?? "",
-      "Availability Status": r.availStatus ?? "No Data",
-      "Match Score": r.scorePct?.toFixed(1) ?? "",
-      Confidence: (r.scorePct ?? 0) >= threshold ? "High" : "Review",
-      "Violation Status (Simple Explanation)": r.decision,
-    }));
-    const needs = detail.filter((d) => d.Confidence !== "High");
-    return { perDriver, detail, needs };
-  }
-
-  async function runCheck() {
-    setMsg("");
-    setPerDriver([]);
-    setDetail([]);
-    setNeeds([]);
-    if (!uncertFile || !availFile) {
-      setMsg("Select both files first.");
-      return;
-    }
-    try {
-      const uncert = await parseUncertified(uncertFile);
-      const avail = await parseAvailability(availFile);
-
-      const byName = new Map(avail.map((a) => [a.nameClean, a]));
-      const rows: any[] = [];
-
-      for (const r of uncert) {
-        let match = byName.get(r.nameClean);
-        let scorePct = 100;
-        if (!match) {
-          let best: AvailRow | null = null;
-          let bestScore = 0;
-          for (const cand of avail) {
-            const s = levRatio(r.nameClean, cand.nameClean);
-            if (s > bestScore) {
-              bestScore = s;
-              best = cand;
-            }
-          }
-          match = best!;
-          scorePct = Math.round((bestScore || 0) * 1000) / 10;
-        }
-        const status = (match?.status || "No Data").toUpperCase();
-        const decision = explain(status);
-        rows.push({
-          driverId: r.driverId,
-          driverName: r.driverName,
-          terminal: r.terminal,
-          date: r.date,
-          matchedName: match?.driverName || "",
-          availStatus: status,
-          scorePct,
-          decision,
-        });
+    // 1) Gather candidates by digit fragment
+    const seen: Record<string, number> = {};
+    for (const [key] of stopsIndex) {
+      const [idNoZeros, stamp] = key.split("|");
+      if (!stamps.includes(stamp)) continue;
+      if (idNoZeros.includes(want)) {
+        seen[idNoZeros] = (seen[idNoZeros] || 0) + 1;
       }
-
-      const { perDriver, detail, needs } = buildTables(rows);
-      setPerDriver(perDriver);
-      setDetail(detail);
-      setNeeds(needs);
-
-      const total = perDriver.length;
-      const dq = perDriver.filter((p) => p.Verdict.startsWith("🚫")).length;
-      setSummary({ total, dq, ok: total - dq });
-      setMsg("✅ Done. Review tables below or download Excel.");
-    } catch (e: any) {
-      setMsg("Error: " + e.message);
     }
+    let cands = Object.keys(seen);
+    if (cands.length <= 1) return cands[0] ?? null;
+
+    // 2) Prefer endsWith, then startsWith
+const ends = cands.filter((id) => id.endsWith(want));
+if (ends.length === 1) return ends[0];
+if (ends.length > 1) cands = ends;
+
+const starts = cands.filter((id) => id.startsWith(want));
+if (starts.length === 1) return starts[0];
+if (starts.length > 1) cands = starts;
+
+// 3) EXTRA: allow truncated prefix (e.g., "7244" matches "72448")
+const prefix = cands.filter((id) => id.startsWith(want));
+if (prefix.length === 1) return prefix[0];
+
+
+    // 3) If still ambiguous and we have last-name info in Stops, filter by last name
+    if (last) {
+      const allowed = new Set<string>();
+      for (const stamp of stamps) {
+        const key = `${last}|${stamp}`;
+        const ids = stopsNameIndex.get(key);
+        if (ids) ids.forEach((id) => allowed.add(id));
+      }
+      const byName = cands.filter((id) => allowed.has(id));
+      if (byName.length === 1) return byName[0];
+    }
+
+    return null; // ambiguous — do not guess
   }
 
-  function downloadExcel() {
-    const wb = XLSX.utils.book_new();
-    const add = (name: string, rows: any[]) =>
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), name.slice(0, 31));
-    add("Per-Driver Verdict", perDriver);
-    add("Row Details", detail);
-    add("Needs Review (Rows)", needs);
-    add(
-      "Legend",
-      [
-        { Explanation: "All processing is client-side in your browser." },
-        { Explanation: "Match Score = Levenshtein similarity 0–100; Confidence=High if >= threshold." },
-        { Explanation: "Decisions:" },
-        { Explanation: "ON/D → ❌ True Violation – Disqualified" },
-        { Explanation: "OFF  → ✅ Excused – Off Duty" },
-        { Explanation: "No Data → ⚠️ Needs Review" },
-      ].map((x) => x as any)
-    );
-    XLSX.writeFile(wb, "DQ_LogCert_Results.xlsx");
+  // UPDATED: robust driver ID extraction — keep all digits, no zero-stripping
+  function extractDriverId(driverName: string | null | undefined): string | null {
+    if (!driverName) return null;
+    const s = String(driverName).trim();
+
+    // Handle truncated sheet names like "... (00009335" (missing ")")
+    const mParenOpen = s.match(/\((\d{4,})\)?$/);
+    if (mParenOpen && mParenOpen[1]) return mParenOpen[1];
+
+    // Normal "(12345678)" anywhere
+    const mParens = s.match(/\((\d{4,})\)/);
+    if (mParens && mParens[1]) return mParens[1];
+
+    // Fallback: grab all trailing digits (no arbitrary cap)
+    const mTail = s.match(/(\d{4,})\s*$/);
+    if (mTail && mTail[1]) return mTail[1];
+
+    // Last resort: first run of 4+ digits anywhere
+    const mAny = s.match(/\d{4,}/);
+    return mAny ? mAny[0] : null;
   }
 
   /* ===================== Payable Hours ===================== */
 
   // Tunables
-  const NEAR_RESET_GRACE_MIN = 30;   // ≥9h30m OFF/SB splits + flags
-  const MAX_SHIFT_HOURS_FLAG = 18;   // flag ultra-long shift
-  const MAX_CONT_ON_HOURS_FLAG = 14; // flag long continuous ON/DRIVING
-  // Layover threshold (used by parseLogsAcrossWorkbooks)
-  const MIN_LAYOVER_HOURS = 2;                // OFF ≥ 2h counts as layover
+  const NEAR_RESET_GRACE_MIN = 30;
+  const MAX_SHIFT_HOURS_FLAG = 18;
+  const MAX_CONT_ON_HOURS_FLAG = 14;
+  const MIN_LAYOVER_HOURS = 2;
   const MIN_LAYOVER_MS = MIN_LAYOVER_HOURS * 3600000;
 
   function toDate(val: any): Date | null {
@@ -727,6 +610,93 @@ export default function Page() {
     return `${mm}:${ss}`;
   }
 
+  // ==== Load Stops file and build lookup indices ====
+  async function loadStopsIntoIndex(file: File) {
+    try {
+      const wb = await readWorkbook(file);
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      if (!sheet) {
+        setStopsIndex(new Map());
+        setStopsNameIndex(new Map()); // NEW
+        return;
+      }
+
+      const rows = XLSX.utils.sheet_to_json<any>(sheet, { defval: null });
+      if (!rows.length) {
+        setStopsIndex(new Map());
+        setStopsNameIndex(new Map()); // NEW
+        return;
+      }
+
+      const keys = Object.keys(rows[0] || {});
+      const find = (re: RegExp) => keys.find((k) => re.test(k));
+
+      const keyRoute = find(/^route$/i) ?? find(/route/i);
+      const keyDate = find(/^arrival\s*date$/i) ?? find(/arrival\s*date/i);
+      const keyDrv1 = find(/^driver1\s*\(tms\)$/i) ?? find(/driver\s*1.*tms/i);
+      const keyDrv2 = find(/^driver2\s*\(tms\)$/i) ?? find(/driver\s*2.*tms/i);
+      // OPTIONAL name columns (best-effort)
+      const keyDrv1Name = find(/^driver1\s*name$/i) ?? find(/driver\s*1.*name/i); // NEW
+      const keyDrv2Name = find(/^driver2\s*name$/i) ?? find(/driver\s*2.*name/i); // NEW
+
+      if (!keyRoute || !keyDate || (!keyDrv1 && !keyDrv2)) {
+        setStopsIndex(new Map());
+        setStopsNameIndex(new Map()); // NEW
+        return;
+      }
+
+      const idx = new Map<string, { route: string; role: "driver1" | "driver2" }[]>();
+      const nameIdx = new Map<string, Set<string>>(); // NEW
+
+      const addHit = (
+        idRaw: any,
+        stamp: string,
+        routeVal: any,
+        role: "driver1" | "driver2",
+        nameRaw?: any
+      ) => {
+        if (idRaw == null || idRaw === "") return;
+        let id = String(idRaw).trim().replace(/\.0+$/, "").replace(/^0+/, "");
+        if (!id || id.toUpperCase() === "UNKNOWN") return;
+        const key = `${id}|${stamp}`;
+        const arr = idx.get(key) || [];
+        arr.push({ route: String(routeVal), role });
+        idx.set(key, arr);
+
+        // NEW: populate last-name index if name present
+        if (nameRaw != null && nameRaw !== "") {
+          const last = extractLastName(String(nameRaw));
+          if (last) {
+            const nk = `${last}|${stamp}`;
+            const set = nameIdx.get(nk) ?? new Set<string>();
+            set.add(id);
+            nameIdx.set(nk, set);
+          }
+        }
+      };
+
+      for (const r of rows) {
+        const routeVal = r[keyRoute];
+        const dateVal = r[keyDate];
+        if (!routeVal || !dateVal) continue;
+
+        const d = toDate(dateVal);
+        if (!d || isNaN(d.getTime())) continue;
+        const stamp = ymd(d);
+
+        if (keyDrv1) addHit(r[keyDrv1], stamp, routeVal, "driver1", keyDrv1Name ? r[keyDrv1Name] : undefined);
+        if (keyDrv2) addHit(r[keyDrv2], stamp, routeVal, "driver2", keyDrv2Name ? r[keyDrv2Name] : undefined);
+      }
+
+      setStopsIndex(idx);
+      setStopsNameIndex(nameIdx); // NEW
+      setStopsIndexCount(idx.size);
+    } catch (e) {
+      setStopsIndex(new Map());
+      setStopsNameIndex(new Map()); // NEW
+    }
+  }
+
   // ===== Parse across ALL workbooks into continuous driver timelines, then build shifts =====
   function parseLogsAcrossWorkbooks(wbs: XLSX.WorkBook[]) {
     type Evt = { ts: Date; status: string; raw: any };
@@ -821,7 +791,8 @@ export default function Page() {
 
       let inOff = false;
       let offStart: Date | null = null;
-      let offLoc: any = null; // <— remember where the OFF block started
+      let offLoc: any = null;
+      let offKind: "OFF" | "SB" | null = null;
 
       let shiftActive = false;
       let shiftStart: Date | null = null;
@@ -852,6 +823,56 @@ export default function Page() {
         if (!shiftStart) return;
         const start = new Date(shiftStart);
         const durationMin = Math.round((end.getTime() - start.getTime()) / 60000);
+
+        // === Fill Route from Stops index using DRIVER ID + dispatch-night rule ===
+if (!currentRoute || !String(currentRoute).trim()) {
+  let drvId = extractDriverId(driverName);                  // may be like "00007244"
+  let idNoZeros = drvId ? drvId.replace(/^0+/, "") : "";    // -> "7244"
+
+  const expected = expectedSeriesForStart(start);
+  const stamps = [ymd(start), ymd(addDays(start, 1))];
+
+  // helper: do we have any exact hits for this id on the window?
+  const hasExactHit = (idNZ: string) => {
+    for (const s of stamps) {
+      if ((stopsIndex.get(`${idNZ}|${s}`) || []).length) return true;
+    }
+    return false;
+  };
+
+  // If no exact hits and the numeric part is short (<=4), try to recover a unique full ID
+  if (!hasExactHit(idNoZeros) && idNoZeros && idNoZeros.length <= 4) {
+    const recovered = resolveShortIdAgainstStops(idNoZeros, start, driverName);
+    if (recovered) {
+      idNoZeros = recovered;   // recovered is already "no-leading-zeros" format
+    }
+  }
+
+  // If still nothing (including the case where there were no digits at all), try last-name only unique match
+  if (!idNoZeros || !hasExactHit(idNoZeros)) {
+    const nameOnly = resolveShortIdAgainstStops(null, start, driverName);
+    if (nameOnly) idNoZeros = nameOnly;
+  }
+
+  // Final lookup if we have something to try
+  if (idNoZeros) {
+    let best: { route: string; role: "driver1" | "driver2" } | null = null;
+
+    for (const s of stamps) {
+      const hits = stopsIndex.get(`${idNoZeros}|${s}`) || [];
+      const seriesMatches =
+        expected == null ? hits : hits.filter(h => routeSeriesBucket(String(h.route)) === expected);
+      const pool = seriesMatches.length ? seriesMatches : hits;
+      const chosen = pool.find(h => h.role === "driver1") ?? pool[0];
+      if (chosen) { best = chosen; break; }
+    }
+
+    currentRoute = best ? String(best.route) : "NO INFO";
+  } else {
+    currentRoute = "NO INFO (no route on stops)";
+  }
+}
+
 
         // ===== Meal breaks (OFF only) =====
         let mealStatus = "";
@@ -921,11 +942,24 @@ export default function Page() {
             }
 
             if (!firstBreak) {
+              const lateFirst = offSegs.find((s) => s.ms >= MEAL_REQ_MS) || null;
               mealStatus = "❌ Violation";
-              mealNotes = "No 1st 30-min OFF before 5th on-duty hour";
+              mealNotes = lateFirst
+                ? `Late 1st ${fmtHM(lateFirst.start)} (${Math.round(lateFirst.ms / 60000)}m) — after deadline ${fmtHM(deadline5)}`
+                : "No 1st 30-min OFF before 5th on-duty hour";
             } else if (needTwo && !secondBreak) {
+              const lateSecond =
+                offSegs.find(
+                  (s) =>
+                    s !== firstBreak &&
+                    s.ms >= MEAL_REQ_MS &&
+                    (!firstBreak || s.start.getTime() > firstBreak.start.getTime())
+                ) || null;
+
               mealStatus = "❌ Violation";
-              mealNotes = "No 2nd 30-min OFF before 10th on-duty hour";
+              mealNotes = lateSecond
+                ? `Late 2nd ${fmtHM(lateSecond.start)} (${Math.round(lateSecond.ms / 60000)}m) — after deadline ${fmtHM(deadline10)}`
+                : "No 2nd 30-min OFF before 10th on-duty hour";
             } else {
               const parts = [`1st ${fmtHM(firstBreak.start)} (${Math.round(firstBreak.ms / 60000)}m)`];
               if (needTwo && secondBreak) {
@@ -978,23 +1012,30 @@ export default function Page() {
           curOnStreakMs = 0;
         }
 
-        if (isOffOrSb(cur.eff)) {
+        if (cur.eff === "OFF" || cur.eff === "SB") {
           if (!inOff) {
             inOff = true;
             offStart = cur.ts;
-            offLoc = cur.raw?.Location ?? cur.raw?.location ?? null; // <— capture where OFF began
+            offLoc = cur.raw?.Location ?? cur.raw?.location ?? null;
+            offKind = cur.eff === "OFF" ? "OFF" : "SB";
           }
           if (shiftActive && next && offStart) {
             const offDur = next.ts.getTime() - offStart.getTime();
             if (offDur >= TEN_HOURS_MS) {
               const extraLayover =
-                offDur >= MIN_LAYOVER_MS && !isNearHome(offLoc) ? Math.round(offDur / 60000) : 0;
+                offKind === "OFF" && offDur >= MIN_LAYOVER_MS && !isNearHome(offLoc)
+                  ? Math.round(offDur / 60000)
+                  : 0;
+
               finalizeAndPush(offStart, { extraLayoverMin: extraLayover });
               shiftActive = false;
             } else if (offDur >= START_BREAK_MIN_MS) {
               const shortBy = TEN_HOURS_MS - offDur;
               const extraLayover =
-                offDur >= MIN_LAYOVER_MS && !isNearHome(offLoc) ? Math.round(offDur / 60000) : 0;
+                offKind === "OFF" && offDur >= MIN_LAYOVER_MS && !isNearHome(offLoc)
+                  ? Math.round(offDur / 60000)
+                  : 0;
+
               finalizeAndPush(offStart, {
                 note: `⚠️ Near reset: short by ${fmtMinSec(shortBy)}`,
                 extraLayoverMin: extraLayover,
@@ -1008,7 +1049,6 @@ export default function Page() {
             if (offStart) {
               const gap = cur.ts.getTime() - offStart.getTime();
               if (gap >= START_BREAK_MIN_MS) {
-                // start a new shift at this ON/D event
                 shiftActive = true;
                 shiftStart = cur.ts;
                 payableMin = 0;
@@ -1021,6 +1061,7 @@ export default function Page() {
             }
             offStart = null;
             offLoc = null;
+            offKind = null;
           }
         }
 
@@ -1029,28 +1070,38 @@ export default function Page() {
           if (isOnOrD(cur.eff)) payableMin += segMin;
           if (cur.eff === "SB") sleeperMin += segMin;
 
-          // in-shift layover: OFF segments away from home lasting >= 2h
           if (cur.eff === "OFF" && !isNearHome(cur.raw?.Location || cur.raw?.location)) {
             if (segMs >= MIN_LAYOVER_MS) layoverMin += segMin;
           }
         }
       }
 
-      // Tail-off at end of data: treat as layover if away from home and >= 2h
+      // Tail-off at end of data: close shift
       const last = timeline[timeline.length - 1];
-      if (shiftActive && offStart && last) {
-        const tailOff = last.ts.getTime() - offStart.getTime();
-        if (tailOff >= TEN_HOURS_MS) {
-          const extraLayover =
-            tailOff >= MIN_LAYOVER_MS && !isNearHome(offLoc) ? Math.round(tailOff / 60000) : 0;
-          finalizeAndPush(offStart, { extraLayoverMin: extraLayover });
-        } else if (tailOff >= START_BREAK_MIN_MS) {
-          const shortBy = TEN_HOURS_MS - tailOff;
-          const extraLayover =
-            tailOff >= MIN_LAYOVER_MS && !isNearHome(offLoc) ? Math.round(tailOff / 60000) : 0;
-          finalizeAndPush(offStart, {
-            note: `⚠️ Near reset (end of data): short by ${fmtMinSec(shortBy)}`,
-            extraLayoverMin: extraLayover,
+      if (shiftActive && last) {
+        if ((last.eff === "OFF" || last.eff === "SB") && offStart) {
+          const tailOff = Math.max(0, last.ts.getTime() - offStart.getTime());
+
+          if (tailOff >= TEN_HOURS_MS) {
+            const extraLayover =
+              tailOff >= MIN_LAYOVER_MS && !isNearHome(offLoc) ? Math.round(tailOff / 60000) : 0;
+            finalizeAndPush(offStart, { extraLayoverMin: extraLayover });
+          } else if (tailOff >= START_BREAK_MIN_MS) {
+            const shortBy = TEN_HOURS_MS - tailOff;
+            const extraLayover =
+              tailOff >= MIN_LAYOVER_MS && !isNearHome(offLoc) ? Math.round(tailOff / 60000) : 0;
+            finalizeAndPush(offStart, {
+              note: `⚠️ Near reset (end of data): short by ${fmtMinSec(shortBy)}`,
+              extraLayoverMin: extraLayover,
+            });
+          } else {
+            finalizeAndPush(offStart, {
+              note: "📄 End-of-file: closing shift at start of OFF/SB (duration after file unknown)",
+            });
+          }
+        } else {
+          finalizeAndPush(last.ts, {
+            note: "📄 End-of-file: still ON/DRIVING — closed at last event",
           });
         }
       }
@@ -1156,100 +1207,21 @@ export default function Page() {
         fontFamily: "system-ui, Segoe UI, Roboto",
       }}
     >
-      <div style={{ maxWidth: 1100, margin: "40px auto", padding: "0 20px" }}>
+      <div style={{ width: "100%", margin: "40px auto", padding: "0 20px" }}>
         <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
-          <h1 style={{ margin: 0, letterSpacing: 0.3 }}>Log Certification DQ Checker</h1>
+          <h1 style={{ margin: 0, letterSpacing: 0.3 }}>Payable Hours</h1>
           <span style={{ color: theme.sub, fontSize: 13 }}>100% in-browser · No uploads · No drama.</span>
         </div>
-
-        {/* Uploader Panel (DQ Checker) */}
-        <Card style={{ marginTop: 16 }}>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
-            <FilePicker
-              label={
-                <>
-                  <span style={{ opacity: 0.9 }}>1) Uncertified Logs</span>{" "}
-                  <code style={{ color: theme.sub }}>(Excel sheet “Uncertified Logs”)</code>
-                </>
-              }
-              accept=".xlsx,.xls,.csv"
-              onFile={setUncertFile}
-              hint='Pick the Uncertified Logs export (sheet name must be "Uncertified Logs").'
-              icon="📘"
-            />
-
-            <FilePicker
-              label={
-                <>
-                  <span style={{ opacity: 0.9 }}>2) Availability</span>{" "}
-                  <code style={{ color: theme.sub }}>(Driver Name + Status/Last Calculated Status)</code>
-                </>
-              }
-              accept=".xlsx,.xls,.csv,.pdf"
-              onFile={setAvailFile}
-              hint="Accepts: .xlsx, .xls, .csv, .pdf"
-              icon="📗"
-            />
-          </div>
-
-          {/* Threshold */}
-          <div style={{ marginTop: 18 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <label style={{ fontWeight: 700 }}>Fuzzy Match Threshold</label>
-              <span
-                style={{
-                  background: theme.panel2,
-                  border: `1px solid ${theme.border}`,
-                  padding: "2px 10px",
-                  borderRadius: 999,
-                  fontWeight: 700,
-                  fontSize: 12,
-                }}
-              >
-                {threshold}
-              </span>
-            </div>
-            <input
-              type="range"
-              min={70}
-              max={95}
-              step={1}
-              value={threshold}
-              onChange={(e) => setThreshold(Number(e.target.value))}
-              style={{ width: "100%", marginTop: 8, accentColor: theme.brand2 }}
-            />
-            <div
-              style={{
-                height: 6,
-                background: `linear-gradient(90deg, ${theme.brand2}, ${theme.brand})`,
-                borderRadius: 999,
-              }}
-            />
-          </div>
-
-          {/* Actions */}
-          <div style={{ marginTop: 16, display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <Button onClick={runCheck}>▶️ Run Check</Button>
-            <Button variant="ghost" onClick={downloadExcel} disabled={!perDriver.length}>
-              ⬇️ Download Excel Results
-            </Button>
-            <div style={{ color: theme.sub, alignSelf: "center" }}>{msg}</div>
-          </div>
-        </Card>
 
         {/* Payable Hours — Per Shift (with filters) */}
         <Card style={{ marginTop: 20 }}>
           <h2 style={{ marginTop: 0 }}>Payable Hours — Per Shift (All Files)</h2>
           <p style={{ color: theme.sub, marginBottom: 12 }}>
-            Upload one or many driver log workbooks. Each sheet = a driver covering ~2 days (night
-            dispatch crossing midnight). We compute <strong>Payable</strong> (ON + DRIVING),
-            <strong> Sleeper Berth</strong> (sum of SB segments), and
-            <strong> Layover</strong> (OFF ≥ 2h away from home) per completed shift. “Near reset”
-            breaks of <strong>≥9h30m</strong> split and are flagged in <strong>Note</strong>. Long shifts or
-            continuous ON/DRIVING are also flagged.
+            Upload driver log workbooks. We compute Payable (ON + DRIVING), Sleeper Berth, and Layover per completed shift.
           </p>
 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 16 }}>
+        {/* Uploaders side-by-side */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
             <FilePicker
               label="Driver Logs Workbooks (one or many)"
               accept=".xlsx,.xls"
@@ -1268,6 +1240,18 @@ export default function Page() {
               }
               hint='Drop multiple .xlsx files. Each sheet = one driver (2-day logs).'
               icon="📘"
+            />
+
+            <FilePicker
+              label='Stops / Dispatch (CSV/XLSX) — must include: "Driver1 (TMS)", "Driver2 (TMS)", "Route", "Arrival Date"'
+              accept=".csv,.xlsx,.xls"
+              onFile={async (f) => {
+                setStopsFile(f);
+                if (f) await loadStopsIntoIndex(f);
+                else { setStopsIndex(new Map()); setStopsNameIndex(new Map()); }
+              }}
+              hint="Used to auto-fill Route by driver ID + arrival date (handles after-midnight first stops). If optional name columns exist, we use them only to disambiguate."
+              icon="🧭"
             />
           </div>
 
@@ -1294,8 +1278,44 @@ export default function Page() {
                     fontSize: 12,
                   }}
                 >
-                  {logsFiles.length}
+                  {logsFiles.length}{stopsFile ? " + Stops" : ""}
                 </span>
+                {stopsFile && (
+                  <>
+                    <span
+                      title={stopsFile.name}
+                      style={{
+                        marginLeft: 8,
+                        background: "rgba(6,182,212,0.15)",
+                        border: `1px solid ${theme.border}`,
+                        color: theme.text,
+                        padding: "4px 8px",
+                        borderRadius: 8,
+                        fontSize: 12,
+                        maxWidth: 280,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      Stops: {stopsFile.name}
+                    </span>
+                    <span
+                      style={{
+                        marginLeft: 8,
+                        background: "rgba(124,58,237,0.12)",
+                        border: `1px solid ${theme.border}`,
+                        color: theme.text,
+                        padding: "4px 8px",
+                        borderRadius: 8,
+                        fontSize: 12,
+                      }}
+                      title="Number of (ID|date) keys in Stops index"
+                    >
+                      Stops index: {stopsIndexCount}
+                    </span>
+                  </>
+                )}
               </div>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 {logsFiles.slice(0, 12).map((f, i) => (
@@ -1425,28 +1445,10 @@ export default function Page() {
           )}
         </Card>
 
-        {/* Summary for DQ checker */}
-        {perDriver.length > 0 && (
-          <>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, marginTop: 18 }}>
-              <Stat label="Total Drivers" value={summary.total} />
-              <Stat label="🚫 Disqualified" value={summary.dq} tone="danger" />
-              <Stat label="✅ Qualified" value={summary.ok} tone="success" />
-            </div>
-
-            <Section title="Per-Driver Verdict">
-              <Table rows={perDriver} />
-            </Section>
-
-            <Section title="Row Details (first 200)">
-              <Table rows={detail.slice(0, 200)} />
-            </Section>
-
-            <Section title="Needs Review (first 200)">
-              <Table rows={needs.slice(0, 200)} />
-            </Section>
-          </>
-        )}
+        {/* DQ Checker */}
+        <div style={{ marginTop: 32 }}>
+          <UncertifiedDQChecker />
+        </div>
       </div>
     </main>
   );
