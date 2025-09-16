@@ -50,6 +50,14 @@ function routeSeriesBucket(route: string): number | null {
   return Math.floor(num / 100) * 100 || 0;
 }
 
+/* >>> NEW: helper to detect layover by the 2nd digit of the route number (0 = layover) <<< */
+function isLayoverRoute(route: string): boolean {
+  const digits = String(route).trim().match(/^(\d{3})/);
+  if (!digits) return false;
+  const first3 = digits[1];
+  return first3.length >= 2 && first3[1] === "0";
+}
+
 function Button({
   children,
   variant = "primary",
@@ -74,7 +82,7 @@ function Button({
       color: "white",
       boxShadow: "0 4px 20px rgba(124,58,237,0.25)",
     },
-  ghost: {
+    ghost: {
       background: "transparent",
       color: theme.text,
       border: `1px solid ${theme.border}`,
@@ -217,9 +225,43 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
-function Table({ rows, columns }: { rows: any[]; columns?: string[] }) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const floatRef = useRef<HTMLDivElement>(null);
+/**
+ * Enhanced Table:
+ * - Sticky header
+ * - Floating bottom scrollbar
+ * - Per-column sort buttons (A→Z / Z→A)
+ * - Per-column filter popover (contains)
+ * - “×” to hide a column
+ */
+/** Table with working header dropdown actions */
+function Table({
+  rows,
+  columns,
+  sortBy,
+  onSortChange,
+  filters,
+  onFilterChange,
+  hiddenCols,
+  onCollapse,
+  onExpand,
+}: {
+  rows: any[];
+  columns?: string[];
+  sortBy?: { col: string; dir: "asc" | "desc" } | null;
+  onSortChange?: (col: string, dir: "asc" | "desc") => void;
+  filters?: Record<string, string>;
+  onFilterChange?: (col: string, value: string) => void;
+  hiddenCols: Set<string>;
+  onCollapse: (col: string) => void;
+  onExpand: (col: string) => void;
+}) {
+  const containerRef = React.useRef<HTMLDivElement>(null);
+  const floatRef = React.useRef<HTMLDivElement>(null);
+
+  const [openMenuCol, setOpenMenuCol] = React.useState<string | null>(null);
+  const [menuPos, setMenuPos] = React.useState<{ left: number; top: number } | null>(null);
+  const [tempFilter, setTempFilter] = React.useState<Record<string, string>>({});
+  const [hoverHidden, setHoverHidden] = React.useState<string | null>(null); // ⬅️ for hover label
 
   if (!rows.length) return <div style={{ color: theme.sub }}>No rows.</div>;
   const cols = columns && columns.length ? columns : Object.keys(rows[0]);
@@ -230,6 +272,53 @@ function Table({ rows, columns }: { rows: any[]; columns?: string[] }) {
     if (!c || !f) return;
     if (src === "container") f.scrollLeft = c.scrollLeft;
     if (src === "float") c.scrollLeft = f.scrollLeft;
+  };
+
+  const HBtn: React.FC<React.ButtonHTMLAttributes<HTMLButtonElement>> = ({
+    children,
+    onClick,
+    ...rest
+  }) => (
+    <button
+      type="button"
+      onPointerDown={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        onClick?.(e as any);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          e.stopPropagation();
+          (onClick as any)?.(e);
+        }
+      }}
+      {...rest}
+      style={{
+        background: "transparent",
+        border: `1px solid ${theme.border}`,
+        color: theme.sub,
+        fontSize: 11,
+        padding: "2px 6px",
+        borderRadius: 6,
+        cursor: "pointer",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {children}
+    </button>
+  );
+
+  const openMenuFor = (col: string, ev: React.MouseEvent) => {
+    const th = (ev.currentTarget as HTMLElement).closest("th");
+    if (th) {
+      const r = th.getBoundingClientRect();
+      setMenuPos({ left: r.left + 8, top: r.bottom });
+    } else {
+      setMenuPos({ left: (ev as any).clientX ?? 20, top: (ev as any).clientY ?? 20 });
+    }
+    setOpenMenuCol(col);
+    setTempFilter((t) => ({ ...t, [col]: filters?.[col] ?? "" }));
   };
 
   return (
@@ -243,52 +332,327 @@ function Table({ rows, columns }: { rows: any[]; columns?: string[] }) {
           borderRadius: 12,
           boxShadow: "0 10px 30px rgba(0,0,0,0.2) inset",
           maxHeight: "70vh",
+          background: theme.panel,
         }}
       >
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
-          <thead style={{ position: "sticky", top: 0, zIndex: 1 }}>
+          <thead
+            style={{
+              position: "sticky",
+              top: 0,
+              zIndex: 2,
+              background: theme.panel2,
+              boxShadow: `0 2px 0 0 ${theme.border}`,
+            }}
+          >
             <tr>
-              {cols.map((c) => (
-                <th
-                  key={c}
-                  style={{
-                    textAlign: "left",
-                    padding: "10px 12px",
-                    borderBottom: `1px solid ${theme.border}`,
-                    background:
-                      "linear-gradient(0deg, rgba(2,6,23,0.0), rgba(2,6,23,0.0)), " + theme.panel2,
-                    color: theme.sub,
-                    whiteSpace: "nowrap",
-                    fontWeight: 700,
-                  }}
-                >
-                  {c}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((r, i) => (
-              <tr key={i} style={{ background: i % 2 ? "rgba(148,163,184,0.04)" : "transparent" }}>
-                {cols.map((c) => (
-                  <td
+              {cols.map((c) => {
+                const isHidden = hiddenCols?.has?.(c);
+
+                if (isHidden) {
+                  // Collapsed header cell with an obvious handle + hover label bubble.
+                  return (
+                    <th
+                      key={c}
+                      style={{
+                        width: 22,
+                        minWidth: 22,
+                        maxWidth: 22,
+                        padding: 0,
+                        borderBottom: `1px solid ${theme.border}`,
+                        background: theme.panel2,
+                        position: "relative",
+                      }}
+                    >
+                      <button
+                        type="button"
+                        onPointerDown={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          onExpand?.(c);
+                        }}
+                        onMouseEnter={() => setHoverHidden(c)}
+                        onMouseLeave={() => setHoverHidden((h) => (h === c ? null : h))}
+                        aria-label={`Show column ${c}`}
+                        title={`Show "${c}"`}
+                        style={{
+                          display: "block",
+                          width: "100%",
+                          height: 36,
+                          cursor: "pointer",
+                          border: "none",
+                          background:
+                            "linear-gradient(180deg, rgba(148,163,184,0.10), rgba(148,163,184,0.04))",
+                          position: "relative",
+                          borderRadius: 8,
+                          outline: `1px dashed ${theme.border}`,
+                          outlineOffset: -3,
+                        }}
+                      >
+                        {/* Chevron icon */}
+                        <svg
+                          width="14"
+                          height="14"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          xmlns="http://www.w3.org/2000/svg"
+                          style={{
+                            position: "absolute",
+                            left: "50%",
+                            top: "50%",
+                            transform: "translate(-50%,-50%)",
+                            opacity: 0.9,
+                          }}
+                        >
+                          <path
+                            d="M10 6l6 6-6 6"
+                            stroke={hoverHidden === c ? (theme.text as any) : (theme.sub as any)}
+                            strokeWidth="2.2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          />
+                        </svg>
+
+                        {/* subtle grip dots */}
+                        <div
+                          aria-hidden
+                          style={{
+                            position: "absolute",
+                            left: "50%",
+                            top: "50%",
+                            transform: "translate(-50%,-50%)",
+                            display: "grid",
+                            gridTemplateRows: "repeat(3, 3px)",
+                            gap: 3,
+                            opacity: 0.25,
+                          }}
+                        >
+                          <span
+                            style={{
+                              display: "block",
+                              width: 2,
+                              height: 2,
+                              borderRadius: 2,
+                              background: theme.text,
+                              marginLeft: 12,
+                            }}
+                          />
+                          <span
+                            style={{
+                              display: "block",
+                              width: 2,
+                              height: 2,
+                              borderRadius: 2,
+                              background: theme.text,
+                              marginLeft: 12,
+                            }}
+                          />
+                          <span
+                            style={{
+                              display: "block",
+                              width: 2,
+                              height: 2,
+                              borderRadius: 2,
+                              background: theme.text,
+                              marginLeft: 12,
+                            }}
+                          />
+                        </div>
+                      </button>
+
+                      {/* Hover label bubble (does not shift layout) */}
+                      {hoverHidden === c && (
+                        <div
+                          style={{
+                            position: "absolute",
+                            top: "50%",
+                            left: "100%",
+                            transform: "translateY(-50%)",
+                            marginLeft: 8,
+                            padding: "4px 8px",
+                            background: theme.panel,
+                            color: theme.text,
+                            border: `1px solid ${theme.border}`,
+                            borderRadius: 8,
+                            whiteSpace: "nowrap",
+                            fontSize: 12,
+                            boxShadow: "0 8px 24px rgba(0,0,0,0.35)",
+                            zIndex: 3,
+                            pointerEvents: "none",
+                          }}
+                        >
+                          Show “{c}”
+                        </div>
+                      )}
+                    </th>
+                  );
+                }
+
+                const activeDir = sortBy?.col === c ? sortBy?.dir : null;
+
+                return (
+                  <th
                     key={c}
                     style={{
-                      padding: "10px 12px",
+                      padding: "8px 12px",
                       borderBottom: `1px solid ${theme.border}`,
                       whiteSpace: "nowrap",
+                      textAlign: "left",
+                      position: "relative",
+                      background: theme.panel2,
                     }}
                   >
-                    {r[c] === undefined || r[c] === null ? "" : String(r[c])}
-                  </td>
-                ))}
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontWeight: 700 }}>{c}</span>
+                      <HBtn title="Column menu" onClick={(e) => openMenuFor(c, e)}>
+                        ▾
+                      </HBtn>
+                      {activeDir && (
+                        <span style={{ fontSize: 11, color: theme.sub }}>
+                          ({activeDir === "asc" ? "A→Z" : "Z→A"})
+                        </span>
+                      )}
+                    </div>
+                  </th>
+                );
+              })}
+            </tr>
+          </thead>
+
+          <tbody>
+            {rows.map((row, i) => (
+              <tr key={i} style={{ background: i % 2 ? "rgba(148,163,184,0.04)" : "transparent" }}>
+                {cols.map((c, idx) => {
+                  if (hiddenCols?.has?.(c)) {
+                    // Body spacer cell to preserve column position.
+                    return (
+                      <td
+                        key={`c-${i}-${idx}`}
+                        style={{
+                          width: 22,
+                          minWidth: 22,
+                          maxWidth: 22,
+                          padding: 0,
+                          borderBottom: `1px solid ${theme.border}`,
+                        }}
+                      />
+                    );
+                  }
+                  const val = row[c];
+                  return (
+                    <td
+                      key={`c-${i}-${idx}`}
+                      style={{
+                        padding: "10px 12px",
+                        borderBottom: `1px solid ${theme.border}`,
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {val === undefined || val === null ? "" : String(val)}
+                    </td>
+                  );
+                })}
               </tr>
             ))}
           </tbody>
         </table>
       </div>
 
-      {/* floating scrollbar */}
+      {/* Fixed-position dropdown (never clipped) */}
+      {openMenuCol && menuPos && (
+        <div
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            position: "fixed",
+            left: menuPos.left,
+            top: menuPos.top,
+            minWidth: 220,
+            background: theme.panel,
+            border: `1px solid ${theme.border}`,
+            borderRadius: 8,
+            padding: 8,
+            boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
+            zIndex: 99999,
+          }}
+        >
+          <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+            <HBtn
+              onClick={() => {
+                onSortChange?.(openMenuCol, "asc");
+                setOpenMenuCol(null);
+              }}
+            >
+              Sort A→Z
+            </HBtn>
+            <HBtn
+              onClick={() => {
+                onSortChange?.(openMenuCol, "desc");
+                setOpenMenuCol(null);
+              }}
+            >
+              Sort Z→A
+            </HBtn>
+            <HBtn
+              onClick={() => {
+                onCollapse?.(openMenuCol);
+                setOpenMenuCol(null);
+              }}
+            >
+              Hide
+            </HBtn>
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <input
+              placeholder="type to filter"
+              value={tempFilter[openMenuCol] ?? ""}
+              onChange={(e) => setTempFilter((t) => ({ ...t, [openMenuCol]: e.target.value }))}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  onFilterChange?.(openMenuCol, tempFilter[openMenuCol] ?? "");
+                  setOpenMenuCol(null);
+                }
+              }}
+              style={{
+                background: theme.panel2,
+                color: theme.text,
+                border: `1px solid ${theme.border}`,
+                borderRadius: 6,
+                padding: "6px 8px",
+                width: 160,
+              }}
+            />
+            <HBtn
+              onClick={() => {
+                onFilterChange?.(openMenuCol, tempFilter[openMenuCol] ?? "");
+                setOpenMenuCol(null);
+              }}
+            >
+              Apply
+            </HBtn>
+            <HBtn
+              onClick={() => {
+                onFilterChange?.(openMenuCol, "");
+                setTempFilter((t) => ({ ...t, [openMenuCol]: "" }));
+                setOpenMenuCol(null);
+              }}
+            >
+              Clear
+            </HBtn>
+          </div>
+        </div>
+      )}
+
+      {/* Click-away */}
+      {openMenuCol && (
+        <div
+          onMouseDown={() => setOpenMenuCol(null)}
+          style={{ position: "fixed", inset: 0, zIndex: 9999, background: "transparent" }}
+        />
+      )}
+
+      {/* Floating scrollbar */}
       <div
         ref={floatRef}
         onScroll={() => syncScroll("float")}
@@ -302,7 +666,7 @@ function Table({ rows, columns }: { rows: any[]; columns?: string[] }) {
           overflowY: "hidden",
           background: theme.panel2,
           borderTop: `1px solid ${theme.border}`,
-          zIndex: 9999,
+          zIndex: 9998,
         }}
       >
         <div style={{ width: containerRef.current?.scrollWidth ?? "100%", height: 1 }} />
@@ -310,6 +674,13 @@ function Table({ rows, columns }: { rows: any[]; columns?: string[] }) {
     </div>
   );
 }
+
+
+
+
+
+
+
 
 /* ===================== Main ===================== */
 export default function Page() {
@@ -374,6 +745,150 @@ export default function Page() {
         return true;
       });
   }, [payableResults, filterDriver, filterFrom, filterTo]);
+
+  /* ===================== >>> ADDED: column visibility / filters / sorting <<< ===================== */
+
+  // Show/hide columns
+  const [visibleCols, setVisibleCols] = useState<string[]>(PAYABLE_COLS);
+  const [hiddenCols, setHiddenCols] = useState<Set<string>>(new Set());
+
+
+  // Per-column filters
+  const [colFilters, setColFilters] = useState<Record<string, string>>({});
+
+  // Sorting (one column at a time)
+  type SortDir = "asc" | "desc";
+  const [sortBy, setSortBy] = useState<{ col: string; dir: SortDir } | null>(null);
+
+  // Compare helper
+  function cmpVal(a: any, b: any) {
+    // Try numbers
+    const na = Number(a), nb = Number(b);
+    if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
+
+    // Try dates
+    const da = new Date(a as any), db = new Date(b as any);
+    if (!Number.isNaN(da.getTime()) && !Number.isNaN(db.getTime())) return da.getTime() - db.getTime();
+
+    // Fallback string/numeric-aware
+    return String(a ?? "").localeCompare(String(b ?? ""), undefined, { numeric: true, sensitivity: "base" });
+  }
+
+  /* >>> NEW: roll up only LAYOVER routes (2nd digit == 0) to ONE LINE per Driver+Route <<< */
+  function rollupLayovers(rows: any[]) {
+  const out: any[] = [];
+  const groups = new Map<string, any>();
+
+  for (const r of rows) {
+    const route = String(r.Route ?? "");
+    const isLayover = isLayoverRoute(route);
+
+    if (!isLayover) {
+      out.push({ ...r }); // non-layover: keep as-is
+      continue;
+    }
+
+    const key = `${r.Driver}|${route}|${r.Source}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        ...r,
+        __startISO: r.__startISO || new Date(r["Shift Start"]).toISOString(),
+        __endISO: r.__endISO || new Date(r["Shift End"]).toISOString(),
+        _sumPayable: parseFloat(r["Payable Hours"] ?? 0),
+        _sumSleeper: parseFloat(r["Sleeper Berth Hours"] ?? 0),
+        _sumLayover: parseFloat(r["Layover Hours"] ?? 0),
+        _meals: new Set<string>(r["Meal Break Compliance"] ? [String(r["Meal Break Compliance"])] : []),
+        _mealNotes: new Set<string>(r["Meal Break Notes"] ? [String(r["Meal Break Notes"])] : []),
+        _notes: new Set<string>(r.Note ? [String(r.Note)] : []),
+      });
+    } else {
+      const g = groups.get(key)!;
+      const sISO = r.__startISO || new Date(r["Shift Start"]).toISOString();
+      const eISO = r.__endISO || new Date(r["Shift End"]).toISOString();
+      if (new Date(sISO) < new Date(g.__startISO)) g.__startISO = sISO;
+      if (new Date(eISO) > new Date(g.__endISO)) g.__endISO = eISO;
+
+      g._sumPayable += parseFloat(r["Payable Hours"] ?? 0);
+      g._sumSleeper += parseFloat(r["Sleeper Berth Hours"] ?? 0);
+      g._sumLayover += parseFloat(r["Layover Hours"] ?? 0);
+
+      if (r["Meal Break Compliance"]) g._meals.add(String(r["Meal Break Compliance"]));
+      if (r["Meal Break Notes"]) g._mealNotes.add(String(r["Meal Break Notes"]));
+      if (r.Note) g._notes.add(String(r.Note));
+    }
+  }
+
+  for (const g of groups.values()) {
+    const start = new Date(g.__startISO);
+    const end = new Date(g.__endISO);
+    const durationHrs = (Math.max(0, end.getTime() - start.getTime()) / 3600000).toFixed(2);
+
+    // Compliance + notes aggregation
+    const mealCompliance =
+      g._meals.size === 1 ? Array.from(g._meals)[0] : `Mixed (${g._meals.size})`;
+
+    const mealNotesJoined = Array.from(g._mealNotes)
+      .map((s: string) => s.trim())
+      .filter(Boolean)
+      .join(" · ");
+
+    out.push({
+      ...g,
+      "Shift Start": start.toLocaleString(),
+      "Shift End": end.toLocaleString(),
+      "Shift Duration (hrs)": durationHrs,
+      "Payable Hours": g._sumPayable.toFixed(2),
+      "Sleeper Berth Hours": g._sumSleeper.toFixed(2),
+      "Layover Hours": g._sumLayover.toFixed(2),
+      "Meal Break Compliance": mealCompliance,
+      "Meal Break Notes": mealNotesJoined || "—", // keep notes if present
+      Note: Array.from(g._notes).filter(Boolean).join(" · "),
+    });
+  }
+
+  return out;
+}
+
+
+  // Final table rows with layover roll-up + column filters + sort applied
+  const tableRows = useMemo(() => {
+    // 1) roll up only layovers
+    let rows = rollupLayovers(filteredPayableRows);
+
+    // 2) apply per-column filters (contains)
+    const active = Object.entries(colFilters).filter(([, v]) => v?.trim());
+    if (active.length) {
+      rows = rows.filter((r) =>
+        active.every(([col, val]) =>
+          String(r[col] ?? "").toLowerCase().includes(val.toLowerCase())
+        )
+      );
+    }
+
+  // 3) apply sorting (use ISO for date columns so it always works)
+if (sortBy) {
+  const { col, dir } = sortBy;
+  rows = [...rows].sort((a, b) => {
+    // prefer hidden ISO timestamps for date columns
+    const aVal =
+      col === "Shift Start" ? (a.__startISO ?? a[col]) :
+      col === "Shift End"   ? (a.__endISO   ?? a[col]) :
+      a[col];
+
+    const bVal =
+      col === "Shift Start" ? (b.__startISO ?? b[col]) :
+      col === "Shift End"   ? (b.__endISO   ?? b[col]) :
+      b[col];
+
+    const c = cmpVal(aVal, bVal);
+    return dir === "asc" ? c : -c;
+  });
+}
+
+
+
+    return rows;
+  }, [filteredPayableRows, colFilters, sortBy, visibleCols]);
 
   /* ===================== Common helpers ===================== */
   async function readWorkbook(file: File) {
@@ -449,18 +964,17 @@ export default function Page() {
     if (cands.length <= 1) return cands[0] ?? null;
 
     // 2) Prefer endsWith, then startsWith
-const ends = cands.filter((id) => id.endsWith(want));
-if (ends.length === 1) return ends[0];
-if (ends.length > 1) cands = ends;
+    const ends = cands.filter((id) => id.endsWith(want));
+    if (ends.length === 1) return ends[0];
+    if (ends.length > 1) cands = ends;
 
-const starts = cands.filter((id) => id.startsWith(want));
-if (starts.length === 1) return starts[0];
-if (starts.length > 1) cands = starts;
+    const starts = cands.filter((id) => id.startsWith(want));
+    if (starts.length === 1) return starts[0];
+    if (starts.length > 1) cands = starts;
 
-// 3) EXTRA: allow truncated prefix (e.g., "7244" matches "72448")
-const prefix = cands.filter((id) => id.startsWith(want));
-if (prefix.length === 1) return prefix[0];
-
+    // 3) EXTRA: allow truncated prefix (e.g., "7244" matches "72448")
+    const prefix = cands.filter((id) => id.startsWith(want));
+    if (prefix.length === 1) return prefix[0];
 
     // 3) If still ambiguous and we have last-name info in Stops, filter by last name
     if (last) {
@@ -557,38 +1071,59 @@ if (prefix.length === 1) return prefix[0];
     return new Date(d);
   }
 
-  const HOME_LAT = 33.90;
-  const HOME_LON = -117.29;
-  const NEAR_RADIUS_MI = 5;
+  // === DC / Geo helpers (single source of truth) ===
+const HOME_LAT = 33.90;
+const HOME_LON = -117.29;
+const NEAR_RADIUS_MI = 5;
 
-  function parseLatLon(locVal: any): { lat: number; lon: number } | null {
-    const s = String(locVal ?? "");
-    const m = s.match(/\(\s*(-?\d{1,3}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)\s*\)/);
-    if (!m) return null;
-    const lat = parseFloat(m[1]);
-    const lon = parseFloat(m[2]);
-    if (isNaN(lat) || isNaN(lon)) return null;
-    return { lat, lon };
-  }
+// Add any DC name variants exactly as they appear in your logs
+const DC_KEYWORDS = [
+  "MORENO VALLEY",
+  "MORENO VLY",
+  "MOR VALLEY",
+  "RIVERSIDE",
+  "MCLANE RIVERSIDE",
+  "MCLANE RIV",
+  "RIV DC",
+  "MV DC",
+  "RIVERSIDE DC",
+  "MORENO VALLEY DC",
+];
 
-  function haversineMiles(lat1: number, lon1: number, lat2: number, lon2: number) {
-    const R = 3958.7613; // miles
-    const toRad = (d: number) => (d * Math.PI) / 180;
-    const dLat = toRad(lat2 - lat1);
-    const dLon = toRad(lon2 - lon1);
-    const a =
-      Math.sin(dLat / 2) ** 2 +
-      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return R * c;
-  }
+function parseLatLon(locVal: any): { lat: number; lon: number } | null {
+  const s = String(locVal ?? "");
+  const m = s.match(/\(\s*(-?\d{1,3}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)\s*\)/);
+  if (!m) return null;
+  const lat = parseFloat(m[1]);
+  const lon = parseFloat(m[2]);
+  if (isNaN(lat) || isNaN(lon)) return null;
+  return { lat, lon };
+}
 
-  function isNearHome(locVal: any): boolean {
-    const p = parseLatLon(locVal);
-    if (p) return haversineMiles(p.lat, p.lon, HOME_LAT, HOME_LON) <= NEAR_RADIUS_MI;
-    const s = String(locVal ?? "").toUpperCase();
-    return /MORENO\s*VALLEY|RIVERSIDE|MCLANE\s*RIVERSIDE/.test(s);
-  }
+function haversineMiles(lat1: number, lon1: number, lat2: number, lon2: number) {
+  const R = 3958.7613; // miles
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  // ✅ correct formula:
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+function isNearHome(locVal: any): boolean {
+  // 1) coordinates inside radius
+  const p = parseLatLon(locVal);
+  if (p && haversineMiles(p.lat, p.lon, HOME_LAT, HOME_LON) <= NEAR_RADIUS_MI) return true;
+
+  // 2) text keywords (case-insensitive)
+  const s = String(locVal ?? "").toUpperCase();
+  return DC_KEYWORDS.some((k) => s.includes(k));
+}
+
+
 
   function extractStatusFromEvent(eventCell: any): string {
     const raw = String(eventCell ?? "");
@@ -699,392 +1234,428 @@ if (prefix.length === 1) return prefix[0];
 
   // ===== Parse across ALL workbooks into continuous driver timelines, then build shifts =====
   function parseLogsAcrossWorkbooks(wbs: XLSX.WorkBook[]) {
-    type Evt = { ts: Date; status: string; raw: any };
-    type TL = { ts: Date; eff: string; raw: any };
+  type Evt = { ts: Date; status: string; raw: any };
+  type TL = { ts: Date; eff: string; raw: any };
 
-    const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
-    const NEAR_RESET_MS = NEAR_RESET_GRACE_MIN * 60 * 1000;
-    const START_BREAK_MIN_MS = TEN_HOURS_MS - NEAR_RESET_MS; // 9h30m
-    const MAX_SHIFT_MS_FLAG = MAX_SHIFT_HOURS_FLAG * 3600000;
-    const MAX_CONT_ON_MS_FLAG = MAX_CONT_ON_HOURS_FLAG * 3600000;
+  const TEN_HOURS_MS = 10 * 60 * 60 * 1000;
+  const NEAR_RESET_MS = NEAR_RESET_GRACE_MIN * 60 * 1000;
+  const START_BREAK_MIN_MS = TEN_HOURS_MS - NEAR_RESET_MS; // 9h30m
+  const MAX_SHIFT_MS_FLAG = MAX_SHIFT_HOURS_FLAG * 3600000;
+  const MAX_CONT_ON_MS_FLAG = MAX_CONT_ON_HOURS_FLAG * 3600000;
+  const MIN_LAYOVER_MS = MIN_LAYOVER_HOURS * 3600000;
 
-    const ON_SET = new Set(["ON", "ON DUTY", "ONDUTY", "ON-DUTY", "ON_DUTY"]);
-    const D_SET = new Set(["D", "DRIVE", "DRIVING"]);
-    const OFF_SET = new Set(["OFF"]);
-    const SB_SET = new Set(["SB", "SLEEPER", "SLEEPER BERTH", "SLEEPER_BERTH"]);
-    const isOnOrD = (s: string) => ON_SET.has(s) || D_SET.has(s);
-    const isOffOrSb = (s: string) => OFF_SET.has(s) || SB_SET.has(s);
+  const ON_SET = new Set(["ON", "ON DUTY", "ONDUTY", "ON-DUTY", "ON_DUTY"]);
+  const D_SET = new Set(["D", "DRIVE", "DRIVING"]);
+  const OFF_SET = new Set(["OFF"]);
+  const SB_SET = new Set(["SB", "SLEEPER", "SLEEPER BERTH", "SLEEPER_BERTH"]);
+  const isOnOrD = (s: string) => ON_SET.has(s) || D_SET.has(s);
 
-    const normKey = (k: string) => String(k).toLowerCase().replace(/\s+/g, "").replace(/[^a-z0-9]/g, "");
-    const findKey = (keys: string[], ...cands: string[]) => {
-      const wanted = cands.map((c) => normKey(c));
-      for (const k of keys) {
-        const nk = normKey(k);
-        if (wanted.some((w) => nk.includes(w))) return k;
-      }
-      return null;
-    };
-
-    // 1) Collect and merge events per driver (sheet name)
-    const evtsByDriver = new Map<string, Evt[]>();
-    for (const wb of wbs) {
-      for (const sheetName of wb.SheetNames) {
-        const sheet = wb.Sheets[sheetName];
-        if (!sheet) continue;
-        const rows = XLSX.utils.sheet_to_json<any>(sheet, { defval: null });
-        if (!rows.length) continue;
-
-        const keys = Object.keys(rows[0] || {});
-        const eventKey = findKey(keys, "event");
-        const startDateKey = findKey(keys, "start date", "startdate", "date start");
-        const startTimeKey = findKey(keys, "start time", "starttime", "time start");
-        const endDateKey = findKey(keys, "end date", "enddate", "date end");
-        const endTimeKey = findKey(keys, "end time", "endtime", "time end");
-        if (!eventKey || (!startDateKey && !endDateKey)) continue;
-
-        const evts: Evt[] = [];
-        for (const r of rows) {
-          let ts: Date | null = null;
-          if ((startDateKey || startTimeKey) && (r[startDateKey!] != null || r[startTimeKey!] != null)) {
-            ts = combineDateTime(r[startDateKey!], r[startTimeKey!]);
-          }
-          if ((!ts || isNaN(ts.getTime())) && (endDateKey || endTimeKey) && (r[endDateKey!] != null || r[endTimeKey!] != null)) {
-            ts = combineDateTime(r[endDateKey!], r[endTimeKey!]);
-          }
-          if (!ts || isNaN(ts.getTime())) continue;
-
-          const status = extractStatusFromEvent(r[eventKey!]);
-          if (!status) continue;
-          evts.push({ ts, status, raw: r });
-        }
-        if (!evts.length) continue;
-
-        evts.sort((a, b) => a.ts.getTime() - b.ts.getTime());
-        // de-dup identical timestamps
-        const dedup: Evt[] = [];
-        let lastTs: number | null = null;
-        for (const e of evts) {
-          const t = e.ts.getTime();
-          if (lastTs !== null && t === lastTs) continue;
-          dedup.push(e);
-          lastTs = t;
-        }
-        const arr = evtsByDriver.get(sheetName) || [];
-        arr.push(...dedup);
-        evtsByDriver.set(sheetName, arr);
-      }
+  const normKey = (k: string) => String(k).toLowerCase().replace(/\s+/g, "").replace(/[^a-z0-9]/g, "");
+  const findKey = (keys: string[], ...cands: string[]) => {
+    const wanted = cands.map((c) => normKey(c));
+    for (const k of keys) {
+      const nk = normKey(k);
+      if (wanted.some((w) => nk.includes(w))) return k;
     }
-
-    // 2) Build shifts per driver using the combined timeline
-    const results: any[] = [];
-    for (const [driverName, arr] of evtsByDriver) {
-      if (!arr.length) continue;
-      arr.sort((a, b) => a.ts.getTime() - b.ts.getTime());
-
-      const timeline: TL[] = [];
-      let lastDuty = "";
-      for (const e of arr) {
-        const isDuty = OFF_SET.has(e.status) || ON_SET.has(e.status) || D_SET.has(e.status) || SB_SET.has(e.status);
-        if (isDuty) lastDuty = e.status;
-        timeline.push({ ts: e.ts, eff: isDuty ? e.status : lastDuty, raw: e.raw });
-      }
-
-      let inOff = false;
-      let offStart: Date | null = null;
-      let offLoc: any = null;
-      let offKind: "OFF" | "SB" | null = null;
-
-      let shiftActive = false;
-      let shiftStart: Date | null = null;
-      let payableMin = 0;
-      let sleeperMin = 0;
-      let layoverMin = 0;
-      let currentRoute = "";
-      let maxOnStreakMs = 0;
-      let curOnStreakMs = 0;
-
-      const rememberRoute = (rawRow: any) => {
-        for (const k of Object.keys(rawRow || {})) {
-          const nk = normKey(k);
-          if (nk.includes("route")) {
-            const v = rawRow[k];
-            if (v != null && currentRoute === "") { currentRoute = String(v); break; }
-          }
-        }
-      };
-
-      function fmtHM(d: Date) {
-        const hh = String(d.getHours()).padStart(2, "0");
-        const mm = String(d.getMinutes()).padStart(2, "0");
-        return `${hh}:${mm}`;
-      }
-
-      function finalizeAndPush(end: Date, opts?: { note?: string; extraLayoverMin?: number }) {
-        if (!shiftStart) return;
-        const start = new Date(shiftStart);
-        const durationMin = Math.round((end.getTime() - start.getTime()) / 60000);
-
-        // === Fill Route from Stops index using DRIVER ID + dispatch-night rule ===
-if (!currentRoute || !String(currentRoute).trim()) {
-  let drvId = extractDriverId(driverName);                  // may be like "00007244"
-  let idNoZeros = drvId ? drvId.replace(/^0+/, "") : "";    // -> "7244"
-
-  const expected = expectedSeriesForStart(start);
-  const stamps = [ymd(start), ymd(addDays(start, 1))];
-
-  // helper: do we have any exact hits for this id on the window?
-  const hasExactHit = (idNZ: string) => {
-    for (const s of stamps) {
-      if ((stopsIndex.get(`${idNZ}|${s}`) || []).length) return true;
-    }
-    return false;
+    return null;
   };
 
-  // If no exact hits and the numeric part is short (<=4), try to recover a unique full ID
-  if (!hasExactHit(idNoZeros) && idNoZeros && idNoZeros.length <= 4) {
-    const recovered = resolveShortIdAgainstStops(idNoZeros, start, driverName);
-    if (recovered) {
-      idNoZeros = recovered;   // recovered is already "no-leading-zeros" format
+  // 1) Collect and merge events per driver (sheet name)
+  const evtsByDriver = new Map<string, Evt[]>();
+  for (const wb of wbs) {
+    for (const sheetName of wb.SheetNames) {
+      const sheet = wb.Sheets[sheetName];
+      if (!sheet) continue;
+      const rows = XLSX.utils.sheet_to_json<any>(sheet, { defval: null });
+      if (!rows.length) continue;
+
+      const keys = Object.keys(rows[0] || {});
+      const eventKey = findKey(keys, "event");
+      const startDateKey = findKey(keys, "start date", "startdate", "date start");
+      const startTimeKey = findKey(keys, "start time", "starttime", "time start");
+      const endDateKey = findKey(keys, "end date", "enddate", "date end");
+      const endTimeKey = findKey(keys, "end time", "endtime", "time end");
+      if (!eventKey || (!startDateKey && !endDateKey)) continue;
+
+      const evts: Evt[] = [];
+      for (const r of rows) {
+        let ts: Date | null = null;
+        if ((startDateKey || startTimeKey) && (r[startDateKey!] != null || r[startTimeKey!] != null)) {
+          ts = combineDateTime(r[startDateKey!], r[startTimeKey!]);
+        }
+        if ((!ts || isNaN(ts.getTime())) && (endDateKey || endTimeKey) && (r[endDateKey!] != null || r[endTimeKey!] != null)) {
+          ts = combineDateTime(r[endDateKey!], r[endTimeKey!]);
+        }
+        if (!ts || isNaN(ts.getTime())) continue;
+
+        const status = extractStatusFromEvent(r[eventKey!]);
+        if (!status) continue;
+        evts.push({ ts, status, raw: r });
+      }
+      if (!evts.length) continue;
+
+      evts.sort((a, b) => a.ts.getTime() - b.ts.getTime());
+      // de-dup identical timestamps
+      const dedup: Evt[] = [];
+      let lastTs: number | null = null;
+      for (const e of evts) {
+        const t = e.ts.getTime();
+        if (lastTs !== null && t === lastTs) continue;
+        dedup.push(e);
+        lastTs = t;
+      }
+      const arr = evtsByDriver.get(sheetName) || [];
+      arr.push(...dedup);
+      evtsByDriver.set(sheetName, arr);
     }
   }
 
-  // If still nothing (including the case where there were no digits at all), try last-name only unique match
-  if (!idNoZeros || !hasExactHit(idNoZeros)) {
-    const nameOnly = resolveShortIdAgainstStops(null, start, driverName);
-    if (nameOnly) idNoZeros = nameOnly;
-  }
+  // 2) Build shifts per driver using the combined timeline
+  const results: any[] = [];
+  for (const [driverName, arr] of evtsByDriver) {
+    if (!arr.length) continue;
+    arr.sort((a, b) => a.ts.getTime() - b.ts.getTime());
 
-  // Final lookup if we have something to try
-  if (idNoZeros) {
-    let best: { route: string; role: "driver1" | "driver2" } | null = null;
-
-    for (const s of stamps) {
-      const hits = stopsIndex.get(`${idNoZeros}|${s}`) || [];
-      const seriesMatches =
-        expected == null ? hits : hits.filter(h => routeSeriesBucket(String(h.route)) === expected);
-      const pool = seriesMatches.length ? seriesMatches : hits;
-      const chosen = pool.find(h => h.role === "driver1") ?? pool[0];
-      if (chosen) { best = chosen; break; }
+    const timeline: TL[] = [];
+    let lastDuty = "";
+    for (const e of arr) {
+      const isDuty = OFF_SET.has(e.status) || ON_SET.has(e.status) || D_SET.has(e.status) || SB_SET.has(e.status);
+      if (isDuty) lastDuty = e.status;
+      timeline.push({ ts: e.ts, eff: isDuty ? e.status : lastDuty, raw: e.raw });
     }
 
-    currentRoute = best ? String(best.route) : "NO INFO";
-  } else {
-    currentRoute = "NO INFO (no route on stops)";
-  }
-}
+    let inOff = false;
+    let offStart: Date | null = null;
+    let offLoc: any = null;
+    let offKind: "OFF" | "SB" | null = null;
 
+    let shiftActive = false;
+    let shiftStart: Date | null = null;
+    let payableMin = 0;
+    let sleeperMin = 0;
+    let layoverMin = 0;
+    let currentRoute = "";
+    let maxOnStreakMs = 0;
+    let curOnStreakMs = 0;
 
-        // ===== Meal breaks (OFF only) =====
-        let mealStatus = "";
-        let mealNotes = "";
-        {
-          const MEAL_REQ_MS = 30 * 60 * 1000;
+    const rememberRoute = (rawRow: any) => {
+      for (const k of Object.keys(rawRow || {})) {
+        const nk = normKey(k);
+        if (nk.includes("route")) {
+          const v = rawRow[k];
+          if (v != null && currentRoute === "") { currentRoute = String(v); break; }
+        }
+      }
+    };
 
-          function onDutyDeadline(limitHours: number): Date {
-            const limitMs = limitHours * 3600000;
-            let acc = 0;
-            for (let j = 0; j < timeline.length - 1; j++) {
-              const cur = timeline[j];
-              const next = timeline[j + 1];
-              if (next.ts <= start || cur.ts >= end) continue;
-              const segStart = new Date(Math.max(cur.ts.getTime(), start.getTime()));
-              const segEnd = new Date(Math.min(next.ts.getTime(), end.getTime()));
-              const segMs = Math.max(0, segEnd.getTime() - segStart.getTime());
-              if (cur.eff === "ON" || cur.eff === "D") {
-                if (acc + segMs >= limitMs) {
-                  const need = limitMs - acc;
-                  return new Date(segStart.getTime() + Math.max(0, need));
-                }
-                acc += segMs;
-              }
-            }
-            return end;
+    function fmtHM(d: Date) {
+      const hh = String(d.getHours()).padStart(2, "0");
+      const mm = String(d.getMinutes()).padStart(2, "0");
+      return `${hh}:${mm}`;
+    }
+
+    function finalizeAndPush(end: Date, opts?: { note?: string; extraLayoverMin?: number }) {
+      if (!shiftStart) return;
+      const start = new Date(shiftStart);
+      const durationMin = Math.round((end.getTime() - start.getTime()) / 60000);
+
+      // === Route fill using Stops index ===
+      if (!currentRoute || !String(currentRoute).trim()) {
+        let drvId = extractDriverId(driverName);
+        let idNoZeros = drvId ? drvId.replace(/^0+/, "") : "";
+
+        const expected = expectedSeriesForStart(start);
+        const stamps = [ymd(start), ymd(addDays(start, 1))];
+
+        const hasExactHit = (idNZ: string) => {
+          for (const s of stamps) {
+            if ((stopsIndex.get(`${idNZ}|${s}`) || []).length) return true;
           }
+          return false;
+        };
 
-          const onDutyMs = payableMin * 60 * 1000;
-          const needTwo = onDutyMs > 12 * 60 * 60 * 1000;
-          const deadline5 = onDutyMs >= 6 * 3600000 ? onDutyDeadline(5) : end;
-          const deadline10 = needTwo ? onDutyDeadline(10) : end;
+        if (!hasExactHit(idNoZeros) && idNoZeros && idNoZeros.length <= 4) {
+          const recovered = resolveShortIdAgainstStops(idNoZeros, start, driverName);
+          if (recovered) idNoZeros = recovered;
+        }
 
-          type OffSeg = { start: Date; end: Date; ms: number };
-          const offSegs: OffSeg[] = [];
+        if (!idNoZeros || !hasExactHit(idNoZeros)) {
+          const nameOnly = resolveShortIdAgainstStops(null, start, driverName);
+          if (nameOnly) idNoZeros = nameOnly;
+        }
+
+        if (idNoZeros) {
+          let best: { route: string; role: "driver1" | "driver2" } | null = null;
+          for (const s of stamps) {
+            const hits = stopsIndex.get(`${idNoZeros}|${s}`) || [];
+            const seriesMatches =
+              expected == null ? hits : hits.filter(h => routeSeriesBucket(String(h.route)) === expected);
+            const pool = seriesMatches.length ? seriesMatches : hits;
+            const chosen = pool.find(h => h.role === "driver1") ?? pool[0];
+            if (chosen) { best = chosen; break; }
+          }
+          currentRoute = best ? String(best.route) : "NO INFO";
+        } else {
+          currentRoute = "NO INFO (no route on stops)";
+        }
+      }
+
+      // ===== Meal breaks (OFF only) =====
+      let mealStatus = "";
+      let mealNotes = "";
+      {
+        const MEAL_REQ_MS = 30 * 60 * 1000;
+
+        function onDutyDeadline(limitHours: number): Date {
+          const limitMs = limitHours * 3600000;
+          let acc = 0;
           for (let j = 0; j < timeline.length - 1; j++) {
             const cur = timeline[j];
             const next = timeline[j + 1];
+            if (next.ts <= start || cur.ts >= end) continue;
             const segStart = new Date(Math.max(cur.ts.getTime(), start.getTime()));
             const segEnd = new Date(Math.min(next.ts.getTime(), end.getTime()));
-            if (segEnd <= segStart) continue;
-            if (cur.ts >= end || next.ts <= start) continue;
-            if (cur.ts < start && next.ts <= start) continue;
-
-            if (cur.eff === "OFF") {
-              offSegs.push({ start: segStart, end: segEnd, ms: Math.max(0, segEnd.getTime() - segStart.getTime()) });
+            const segMs = Math.max(0, segEnd.getTime() - segStart.getTime());
+            if (cur.eff === "ON" || cur.eff === "D") {
+              if (acc + segMs >= limitMs) {
+                const need = limitMs - acc;
+                return new Date(segStart.getTime() + Math.max(0, need));
+              }
+              acc += segMs;
             }
           }
+          return end;
+        }
 
-          let firstBreak: OffSeg | null = null;
-          let secondBreak: OffSeg | null = null;
+        const onDutyMs = payableMin * 60 * 1000;
+        const needTwo = onDutyMs > 12 * 60 * 60 * 1000;
+        const deadline5 = onDutyMs >= 6 * 3600000 ? onDutyDeadline(5) : end;
+        const deadline10 = needTwo ? onDutyDeadline(10) : end;
 
-          if (onDutyMs < 6 * 3600000) {
-            mealStatus = "✅ Compliant";
-            mealNotes = "No break required (<6h on-duty)";
+        type OffSeg = { start: Date; end: Date; ms: number };
+        const offSegs: OffSeg[] = [];
+        for (let j = 0; j < timeline.length - 1; j++) {
+          const cur = timeline[j];
+          const next = timeline[j + 1];
+          const segStart = new Date(Math.max(cur.ts.getTime(), start.getTime()));
+          const segEnd = new Date(Math.min(next.ts.getTime(), end.getTime()));
+          if (segEnd <= segStart) continue;
+          if (cur.ts >= end || next.ts <= start) continue;
+          if (cur.ts < start && next.ts <= start) continue;
+
+          if (cur.eff === "OFF") {
+            offSegs.push({ start: segStart, end: segEnd, ms: Math.max(0, segEnd.getTime() - segStart.getTime()) });
+          }
+        }
+
+        let firstBreak: OffSeg | null = null;
+        let secondBreak: OffSeg | null = null;
+
+        if (onDutyMs < 6 * 3600000) {
+          mealStatus = "✅ Compliant";
+          mealNotes = "No break required (<6h on-duty)";
+        } else {
+          firstBreak = offSegs.find((s) => s.start < deadline5 && s.ms >= MEAL_REQ_MS) || null;
+          if (needTwo) {
+            secondBreak =
+              offSegs.find(
+                (s) =>
+                  s !== firstBreak &&
+                  s.start < deadline10 &&
+                  s.ms >= MEAL_REQ_MS &&
+                  (!firstBreak || s.start.getTime() > firstBreak.start.getTime())
+              ) || null;
+          }
+
+          if (!firstBreak) {
+            const lateFirst = offSegs.find((s) => s.ms >= MEAL_REQ_MS) || null;
+            mealStatus = "❌ Violation";
+            mealNotes = lateFirst
+              ? `Late 1st ${fmtHM(lateFirst.start)} (${Math.round(lateFirst.ms / 60000)}m) — after deadline ${fmtHM(deadline5)}`
+              : "No 1st 30-min OFF before 5th on-duty hour";
+          } else if (needTwo && !secondBreak) {
+            const lateSecond =
+              offSegs.find(
+                (s) =>
+                  s !== firstBreak &&
+                  s.ms >= MEAL_REQ_MS &&
+                  (!firstBreak || s.start.getTime() > firstBreak.start.getTime())
+              ) || null;
+
+            mealStatus = "❌ Violation";
+            mealNotes = lateSecond
+              ? `Late 2nd ${fmtHM(lateSecond.start)} (${Math.round(lateSecond.ms / 60000)}m) — after deadline ${fmtHM(deadline10)}`
+              : "No 2nd 30-min OFF before 10th on-duty hour";
           } else {
-            firstBreak = offSegs.find((s) => s.start < deadline5 && s.ms >= MEAL_REQ_MS) || null;
-            if (needTwo) {
-              secondBreak =
-                offSegs.find(
-                  (s) =>
-                    s !== firstBreak &&
-                    s.start < deadline10 &&
-                    s.ms >= MEAL_REQ_MS &&
-                    (!firstBreak || s.start.getTime() > firstBreak.start.getTime())
-                ) || null;
+            const parts = [`1st ${fmtHM(firstBreak.start)} (${Math.round(firstBreak.ms / 60000)}m)`];
+            if (needTwo && secondBreak) {
+              parts.push(`2nd ${fmtHM(secondBreak.start)} (${Math.round(secondBreak.ms / 60000)}m)`);
             }
-
-            if (!firstBreak) {
-              const lateFirst = offSegs.find((s) => s.ms >= MEAL_REQ_MS) || null;
-              mealStatus = "❌ Violation";
-              mealNotes = lateFirst
-                ? `Late 1st ${fmtHM(lateFirst.start)} (${Math.round(lateFirst.ms / 60000)}m) — after deadline ${fmtHM(deadline5)}`
-                : "No 1st 30-min OFF before 5th on-duty hour";
-            } else if (needTwo && !secondBreak) {
-              const lateSecond =
-                offSegs.find(
-                  (s) =>
-                    s !== firstBreak &&
-                    s.ms >= MEAL_REQ_MS &&
-                    (!firstBreak || s.start.getTime() > firstBreak.start.getTime())
-                ) || null;
-
-              mealStatus = "❌ Violation";
-              mealNotes = lateSecond
-                ? `Late 2nd ${fmtHM(lateSecond.start)} (${Math.round(lateSecond.ms / 60000)}m) — after deadline ${fmtHM(deadline10)}`
-                : "No 2nd 30-min OFF before 10th on-duty hour";
-            } else {
-              const parts = [`1st ${fmtHM(firstBreak.start)} (${Math.round(firstBreak.ms / 60000)}m)`];
-              if (needTwo && secondBreak) {
-                parts.push(`2nd ${fmtHM(secondBreak.start)} (${Math.round(secondBreak.ms / 60000)}m)`);
-              }
-              mealStatus = "✅ Compliant";
-              mealNotes = parts.join(" · ");
-            }
-          }
-        }
-
-        const flags: string[] = [];
-        if (opts?.note) flags.push(opts.note);
-        if (durationMin * 60000 > MAX_SHIFT_MS_FLAG) {
-          flags.push(`⚠️ Long shift ${(durationMin/60).toFixed(2)}h (possible missed OFF)`);
-        }
-        if (maxOnStreakMs > MAX_CONT_ON_MS_FLAG) {
-          flags.push(`⚠️ Continuous ON/DRIVING ${(maxOnStreakMs/3600000).toFixed(2)}h (possible forgot to log OFF)`);
-        }
-
-        const layoverTotalMin = layoverMin + (opts?.extraLayoverMin ?? 0);
-
-        results.push({
-          Driver: driverName,
-          Route: currentRoute,
-          "Shift Start": start.toLocaleString(),
-          "Shift End": end.toLocaleString(),
-          __startISO: start.toISOString(),
-          __endISO: end.toISOString(),
-          "Shift Duration (hrs)": (durationMin / 60).toFixed(2),
-          "Payable Hours": (payableMin / 60).toFixed(2),
-          "Sleeper Berth Hours": (sleeperMin / 60).toFixed(2),
-          "Layover Hours": (layoverTotalMin / 60).toFixed(2),
-          "Meal Break Compliance": mealStatus,
-          "Meal Break Notes": mealNotes,
-          Note: flags.join(" · "),
-        });
-      }
-
-      for (let i = 0; i < timeline.length; i++) {
-        const cur = timeline[i];
-        const next = timeline[i + 1] || null;
-        const segMs = next ? Math.max(0, next.ts.getTime() - cur.ts.getTime()) : 0;
-        const segMin = Math.round(segMs / 60000);
-
-        if (isOnOrD(cur.eff)) {
-          curOnStreakMs += segMs;
-          if (curOnStreakMs > maxOnStreakMs) maxOnStreakMs = curOnStreakMs;
-        } else {
-          curOnStreakMs = 0;
-        }
-
-        if (cur.eff === "OFF" || cur.eff === "SB") {
-          if (!inOff) {
-            inOff = true;
-            offStart = cur.ts;
-            offLoc = cur.raw?.Location ?? cur.raw?.location ?? null;
-            offKind = cur.eff === "OFF" ? "OFF" : "SB";
-          }
-          if (shiftActive && next && offStart) {
-            const offDur = next.ts.getTime() - offStart.getTime();
-            if (offDur >= TEN_HOURS_MS) {
-              const extraLayover =
-                offKind === "OFF" && offDur >= MIN_LAYOVER_MS && !isNearHome(offLoc)
-                  ? Math.round(offDur / 60000)
-                  : 0;
-
-              finalizeAndPush(offStart, { extraLayoverMin: extraLayover });
-              shiftActive = false;
-            } else if (offDur >= START_BREAK_MIN_MS) {
-              const shortBy = TEN_HOURS_MS - offDur;
-              const extraLayover =
-                offKind === "OFF" && offDur >= MIN_LAYOVER_MS && !isNearHome(offLoc)
-                  ? Math.round(offDur / 60000)
-                  : 0;
-
-              finalizeAndPush(offStart, {
-                note: `⚠️ Near reset: short by ${fmtMinSec(shortBy)}`,
-                extraLayoverMin: extraLayover,
-              });
-              shiftActive = false;
-            }
-          }
-        } else {
-          if (inOff) {
-            inOff = false;
-            if (offStart) {
-              const gap = cur.ts.getTime() - offStart.getTime();
-              if (gap >= START_BREAK_MIN_MS) {
-                shiftActive = true;
-                shiftStart = cur.ts;
-                payableMin = 0;
-                sleeperMin = 0;
-                layoverMin = 0;
-                currentRoute = "";
-                maxOnStreakMs = 0;
-                curOnStreakMs = 0;
-              }
-            }
-            offStart = null;
-            offLoc = null;
-            offKind = null;
-          }
-        }
-
-        if (shiftActive && next) {
-          rememberRoute(cur.raw);
-          if (isOnOrD(cur.eff)) payableMin += segMin;
-          if (cur.eff === "SB") sleeperMin += segMin;
-
-          if (cur.eff === "OFF" && !isNearHome(cur.raw?.Location || cur.raw?.location)) {
-            if (segMs >= MIN_LAYOVER_MS) layoverMin += segMin;
+            mealStatus = "✅ Compliant";
+            mealNotes = parts.join(" · ");
           }
         }
       }
 
-      // Tail-off at end of data: close shift
-      const last = timeline[timeline.length - 1];
-      if (shiftActive && last) {
-        if ((last.eff === "OFF" || last.eff === "SB") && offStart) {
+      const flags: string[] = [];
+      if (opts?.note) flags.push(opts.note);
+      if (durationMin * 60000 > MAX_SHIFT_MS_FLAG) {
+        flags.push(`⚠️ Long shift ${(durationMin/60).toFixed(2)}h (possible missed OFF)`);
+      }
+      if (maxOnStreakMs > MAX_CONT_ON_MS_FLAG) {
+        flags.push(`⚠️ Continuous ON/DRIVING ${(maxOnStreakMs/3600000).toFixed(2)}h (possible forgot to log OFF)`);
+      }
+
+      const layoverTotalMin = layoverMin + (opts?.extraLayoverMin ?? 0);
+
+      results.push({
+        Driver: driverName,
+        Route: currentRoute,
+        "Shift Start": start.toLocaleString(),
+        "Shift End": end.toLocaleString(),
+        __startISO: start.toISOString(),
+        __endISO: end.toISOString(),
+        "Shift Duration (hrs)": (durationMin / 60).toFixed(2),
+        "Payable Hours": (payableMin / 60).toFixed(2),
+        "Sleeper Berth Hours": (sleeperMin / 60).toFixed(2),
+        "Layover Hours": (layoverTotalMin / 60).toFixed(2),
+        "Meal Break Compliance": mealStatus,
+        "Meal Break Notes": mealNotes,
+        Note: flags.join(" · "),
+      });
+    }
+
+    // ====== MAIN SCAN ======
+    for (let i = 0; i < timeline.length; i++) {
+      const cur = timeline[i];
+      const next = timeline[i + 1] || null;
+      const segMs = next ? Math.max(0, next.ts.getTime() - cur.ts.getTime()) : 0;
+      const segMin = Math.round(segMs / 60000);
+
+      // Track continuous ON/D streak for diagnostics
+      if (isOnOrD(cur.eff)) {
+        curOnStreakMs += segMs;
+        if (curOnStreakMs > maxOnStreakMs) maxOnStreakMs = curOnStreakMs;
+      } else {
+        curOnStreakMs = 0;
+      }
+
+      if (cur.eff === "OFF" || cur.eff === "SB") {
+        // entering or staying in OFF/SB
+        if (!inOff) {
+          inOff = true;
+          offStart = cur.ts;
+          offLoc = cur.raw?.Location ?? cur.raw?.location ?? null;
+          offKind = cur.eff === "OFF" ? "OFF" : "SB";
+        }
+
+        // If we are mid-shift…
+        if (shiftActive && next && offStart) {
+          // (A) If we transition from SB -> OFF, END SHIFT AT THE OFF timestamp (driver reached DC).
+          if (cur.eff !== "OFF" && next.eff === "OFF") {
+            // end at OFF (no layover added here; layover accrues after the shift)
+            finalizeAndPush(next.ts);
+            shiftActive = false;
+            continue;
+          }
+
+          // (B) Fallback end by long OFF away from DC (legacy): if reset or near-reset happens without an OFF flip
+          const offDur = next.ts.getTime() - offStart.getTime();
+          if (offDur >= TEN_HOURS_MS) {
+            const extraLayover =
+              offKind === "OFF" && offDur >= MIN_LAYOVER_MS && !isNearHome(offLoc)
+                ? Math.round(offDur / 60000)
+                : 0;
+            finalizeAndPush(offStart, { extraLayoverMin: extraLayover });
+            shiftActive = false;
+          } else if (offDur >= START_BREAK_MIN_MS) {
+            const shortBy = TEN_HOURS_MS - offDur;
+            const extraLayover =
+              offKind === "OFF" && offDur >= MIN_LAYOVER_MS && !isNearHome(offLoc)
+                ? Math.round(offDur / 60000)
+                : 0;
+            finalizeAndPush(offStart, {
+              note: `⚠️ Near reset: short by ${fmtMinSec(shortBy)}`,
+              extraLayoverMin: extraLayover,
+            });
+            shiftActive = false;
+          }
+        }
+      } else {
+        // leaving OFF/SB into a duty status (ON or D)
+        if (inOff) {
+          inOff = false;
+          if (offStart) {
+            const gap = cur.ts.getTime() - offStart.getTime();
+            if (gap >= START_BREAK_MIN_MS) {
+              // === Start NEW shift ===
+              // START TIME RULE:
+              // If the last part of that OFF/SB block was SB (B-driver case),
+              // shiftStart = the beginning of the contiguous SB block leading into this ON/D.
+              // Else, normal: shiftStart = this ON/D timestamp.
+              let startAt = cur.ts;
+              let sleeperToCountMs = 0;
+
+              // Walk backward over contiguous SB segments immediately preceding this ON/D.
+              // (We stop at the first non-SB or the offStart boundary.)
+              let j = i - 1;
+              if (j >= 0 && SB_SET.has(timeline[j].eff)) {
+                let sbStart = timeline[j].ts;
+                while (j - 1 >= 0 && SB_SET.has(timeline[j - 1].eff) && timeline[j - 1].ts >= (offStart || timeline[j - 1].ts)) {
+                  j -= 1;
+                  sbStart = timeline[j].ts;
+                }
+                startAt = sbStart;                      // shift starts at beginning of the SB block
+                sleeperToCountMs = cur.ts.getTime() - sbStart.getTime(); // count full SB block into sleeper
+              }
+
+              shiftActive = true;
+              shiftStart = startAt;
+              payableMin = 0;
+              sleeperMin = Math.round(sleeperToCountMs / 60000); // include initial SB-at-start
+              layoverMin = 0;
+              currentRoute = "";
+              maxOnStreakMs = 0;
+              curOnStreakMs = 0;
+            }
+          }
+          offStart = null;
+          offLoc = null;
+          offKind = null;
+        }
+      }
+
+      // While shift is active, accumulate payable and sleeper
+      if (shiftActive && next) {
+        rememberRoute(cur.raw);
+        if (isOnOrD(cur.eff)) payableMin += segMin;
+        if (SB_SET.has(cur.eff)) sleeperMin += segMin;
+        // Layover: not accrued mid-shift — added only when the shift ENDS
+      }
+    }
+
+    // Tail-off at end of data: close shift
+    const last = timeline[timeline.length - 1];
+    if (shiftActive && last) {
+      if ((last.eff === "OFF" || last.eff === "SB") && offStart) {
+        // Prefer OFF if it appears after SB at the end; otherwise default behavior.
+        // Find first OFF timestamp >= offStart
+        let endAt: Date | null = null;
+        for (let k = timeline.length - 1; k >= 0; k--) {
+          if (timeline[k].ts < offStart) break;
+          if (timeline[k].eff === "OFF") endAt = timeline[k].ts;
+        }
+
+        if (endAt) {
+          finalizeAndPush(endAt);
+        } else {
+          // Fallback to legacy end logic
           const tailOff = Math.max(0, last.ts.getTime() - offStart.getTime());
-
           if (tailOff >= TEN_HOURS_MS) {
             const extraLayover =
-              tailOff >= MIN_LAYOVER_MS && !isNearHome(offLoc) ? Math.round(tailOff / 60000) : 0;
+              offKind === "OFF" && tailOff >= MIN_LAYOVER_MS && !isNearHome(offLoc)
+                ? Math.round(tailOff / 60000)
+                : 0;
             finalizeAndPush(offStart, { extraLayoverMin: extraLayover });
           } else if (tailOff >= START_BREAK_MIN_MS) {
             const shortBy = TEN_HOURS_MS - tailOff;
@@ -1099,16 +1670,19 @@ if (!currentRoute || !String(currentRoute).trim()) {
               note: "📄 End-of-file: closing shift at start of OFF/SB (duration after file unknown)",
             });
           }
-        } else {
-          finalizeAndPush(last.ts, {
-            note: "📄 End-of-file: still ON/DRIVING — closed at last event",
-          });
         }
+      } else {
+        finalizeAndPush(last.ts, {
+          note: "📄 End-of-file: still ON/DRIVING — closed at last event",
+        });
       }
     }
-
-    return results;
   }
+
+  return results;
+}
+
+
 
   function aggregateByDriver(rows: any[]) {
     const sum = new Map<
@@ -1220,7 +1794,7 @@ if (!currentRoute || !String(currentRoute).trim()) {
             Upload driver log workbooks. We compute Payable (ON + DRIVING), Sleeper Berth, and Layover per completed shift.
           </p>
 
-        {/* Uploaders side-by-side */}
+          {/* Uploaders side-by-side */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
             <FilePicker
               label="Driver Logs Workbooks (one or many)"
@@ -1243,7 +1817,7 @@ if (!currentRoute || !String(currentRoute).trim()) {
             />
 
             <FilePicker
-              label='Stops / Dispatch (CSV/XLSX) — must include: "Driver1 (TMS)", "Driver2 (TMS)", "Route", "Arrival Date"'
+              label='Stops / Dispatch (CSV/XLSX)'
               accept=".csv,.xlsx,.xls"
               onFile={async (f) => {
                 setStopsFile(f);
@@ -1435,13 +2009,40 @@ if (!currentRoute || !String(currentRoute).trim()) {
             </div>
           </div>
 
+          
+
           {filteredPayableRows.length > 0 && (
             <Section title="Per Shift (All Files)">
-              <Table
-                rows={filteredPayableRows.map(({ __startISO, __endISO, ...rest }) => rest)}
-                columns={PAYABLE_COLS}
-              />
-            </Section>
+  <Table
+    rows={tableRows.map(({ __startISO, __endISO, ...rest }) => rest)}
+    columns={PAYABLE_COLS}
+    // sorting
+    sortBy={sortBy}
+    onSortChange={(col, dir) => setSortBy({ col, dir })}
+    // filtering (kept)
+    filters={colFilters}
+    onFilterChange={(col, value) =>
+      setColFilters((prev) => ({ ...prev, [col]: value }))
+    }
+    // collapse/expand
+    hiddenCols={hiddenCols}
+    onCollapse={(col) =>
+      setHiddenCols((prev) => {
+        const next = new Set(prev);
+        next.add(col);
+        return next;
+      })
+    }
+    onExpand={(col) =>
+      setHiddenCols((prev) => {
+        const next = new Set(prev);
+        next.delete(col);
+        return next;
+      })
+    }
+  />
+</Section>
+
           )}
         </Card>
 
