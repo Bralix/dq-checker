@@ -827,10 +827,11 @@ export default function Page() {
     const mealCompliance =
       g._meals.size === 1 ? Array.from(g._meals)[0] : `Mixed (${g._meals.size})`;
 
-    const mealNotesJoined = Array.from(g._mealNotes)
-      .map((s: string) => s.trim())
-      .filter(Boolean)
-      .join(" · ");
+   const mealNotesJoined = Array.from(g._mealNotes as Iterable<string>)
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .join(" · ");
+
 
     out.push({
       ...g,
